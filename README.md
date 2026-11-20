@@ -24,7 +24,7 @@ include(FetchContent)
 FetchContent_Declare(
     gorun
     GIT_REPOSITORY https://github.com/Takatochi/gorun.git
-    GIT_TAG        v0.1.0-alpha # or main
+    GIT_TAG        v0.2.0-alpha # or main
 )
 FetchContent_MakeAvailable(gorun)
 
@@ -59,7 +59,7 @@ cmake --install build --prefix /usr/local   # or C:/Program Files/gorun on Windo
 ```
 Then in any downstream CMake project:
 ```cmake
-find_package(gorun 0.1.0 REQUIRED CONFIG)
+find_package(gorun 0.2.0 REQUIRED CONFIG)
 target_link_libraries(my_app PRIVATE gorun::gorun)
 ```
 
@@ -509,6 +509,73 @@ When multiple `GORUN_DEFER` statements are declared in the same scope, C++ destr
 
 ---
 
+### 6. Go-Style Cascading Request `gorun::Context` (`with_cancel`, `with_timeout`, `with_deadline`, `with_value`)
+
+Modeled directly on Go's standard `context.Context` package, `gorun::Context` is the backbone for building **HTTP web frameworks**, **gRPC/REST microservices**, and **database drivers**:
+1. **Cascading Cancellation Tree:** Cancelling a parent context atomically cancels all child and descendant contexts (`ContextError::Canceled`), signals their `std::stop_token`, and closes their broadcast `done()` channel (`Channel<bool>`), waking all routines waiting in `gorun::select(..., ctx.on_done(...))`.
+2. **Non-OS-Blocking Deadlines & Timeouts (`with_timeout` / `with_deadline`):** Automatically clamps a child's deadline to its parent's deadline (if the parent expires earlier) and schedules an expiration callback on the runtime's min-heap timer thread (`ContextError::DeadlineExceeded`).
+3. **Immutable Lock-Free Request Metadata (`with_value` & `ctx.value<T>(key)`):** Carries request-scoped values (`trace_id`, `user_id`, auth claims) across green routine boundaries with zero mutex locks on read.
+
+```mermaid
+flowchart TD
+    BG["gorun::background()\n(Root Context — Never Canceled)"]
+    REQ["req_ctx = gorun::with_value(BG, 'trace_id', 'http-7749')\n+ gorun::with_timeout(..., 50ms)"]
+    AUTH["auth_ctx = gorun::with_cancel(req_ctx)\n(Auth Microservice RPC)"]
+    DB["db_ctx = gorun::with_timeout(req_ctx, 20ms)\n(PostgreSQL Query — Clamped to <= 50ms)"]
+    CACHE["cache_ctx = gorun::with_value(req_ctx, 'shard', 'redis-02')\n(Redis Lookup)"]
+
+    BG --> REQ
+    REQ -->|"Cascades cancel / timeout\n& inherits 'trace_id'"| AUTH
+    REQ -->|"Cascades cancel / timeout\n& inherits 'trace_id'"| DB
+    REQ -->|"Cascades cancel / timeout\n& inherits 'trace_id'"| CACHE
+```
+
+```cpp
+#include <iostream>
+#include <string>
+#include "gorun/gorun.hpp"
+
+using namespace std::chrono_literals;
+
+void handle_http_request() {
+    // 1. Attach request-scoped metadata (Trace ID & User ID)
+    auto base_ctx = gorun::with_value(gorun::background(), "trace_id", std::string("http-req-7749"));
+    base_ctx = gorun::with_value(base_ctx, "user_id", 1024);
+
+    // 2. Enforce a 25ms SLA timeout for the entire HTTP request handler
+    auto [req_ctx, cancel] = gorun::with_timeout(base_ctx, 25ms);
+    GORUN_DEFER { cancel(); }; // Always release context resources on exit!
+
+    gorun::Channel<std::string> db_result_ch(1);
+
+    // 3. Spawn a child database query routine passing `req_ctx` by value (cheap shared_ptr copy)
+    gorun::go([&, req_ctx]() {
+        gorun::select(
+            gorun::on_timeout(100ms, [&]() {
+                db_result_ch.send("SELECT * FROM users -> {id: 1024}");
+            }),
+            req_ctx.on_done([&]() {
+                // Immediately aborts the query when req_ctx expires at 25ms!
+            })
+        );
+    });
+
+    // 4. Wait for either the DB query result or context cancellation/timeout
+    gorun::select(
+        db_result_ch.on_recv([](std::string row) {
+            std::cout << "[200 OK] " << row << "\n";
+        }),
+        req_ctx.on_done([&]() {
+            std::cout << "[504 Gateway Timeout] Trace=" << *req_ctx.value<std::string>("trace_id")
+                      << " User=" << *req_ctx.value<int>("user_id")
+                      << " Reason=" << gorun::to_string(*req_ctx.err()) << "\n";
+        })
+    );
+}
+```
+
+---
+
 ## Ecosystem Comparison: `gorun` vs. Popular C++ Concurrency Libraries
 
 When building high-concurrency network services or web frameworks in C++, developers traditionally face a painful trade-off between **OS threads** (`std::jthread`), **C++20 stackless coroutines** (`co_await` / Boost.Asio), **Boost.Fiber**, or **DAG task graphs** (Cpp-Taskflow).
@@ -522,6 +589,7 @@ Here is how `gorun` compares against the leading C++ alternatives across ergonom
 | **"Function Coloring" Problem** | **No** (Suspend from any nested depth!) | No | No | **Yes** (`co_await` infects every return type `Task<T>`) | No | Cannot suspend mid-task on I/O |
 | **Zero-Setup `go(...)` in `main()`** | **Yes** (Lazy global runtime + `UniversalWaiter`) | Yes (`std::jthread`) | No (Manual fiber scheduler setup per thread) | No (Requires explicit `io_context.run()`) | Partial | No (Requires `tf::Executor`) |
 | **Structured Concurrency (`Scope`)** | **Yes** (`gorun::Scope` auto-captures nested `go([&])`) | No | No (Manual `fiber.join()`) | Partial | No | Yes (`tf::Subflow`) |
+| **Cascading Request `Context`** | **Yes** (`with_cancel`, `with_timeout`, `with_value`, `ctx.on_done`) | No | No | Manual `asio::cancellation_slot` | No | No |
 | **Multi-Channel `select(...)`** | **Yes** (`on_recv`, `on_send`, `on_timeout`, `on_default`) | No | No built-in `select` | Requires custom `when_any` | No variadic `select` | No channels |
 | **Go-Style `defer` Cleanup** | **Yes** (`GORUN_DEFER { ... };` & `gorun::defer`) | No | No | No | No | No |
 | **RAM per 10,000 Concurrent Tasks** | **~8–64 MB** (Pooled virtual stacks) | **~10–80 GB** (Crashes OS handle limit!) | ~64–128 MB | ~4–16 MB (Heap allocation per call frame) | ~64–128 MB | N/A (Cannot hold 10k parked I/O tasks) |
@@ -631,9 +699,9 @@ xychart-beta
 
 ---
 
-## Comprehensive Verification & Race-Condition Test Suite (20 Suites)
+## Comprehensive Verification & Race-Condition Test Suite (21 Suites)
 
-The test binary (`gorun_tests.exe` / [tests/test_main.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/tests/test_main.cpp)) validates all core invariants, concurrency primitives, race conditions, and edge cases across 20 test suites:
+The test binary (`gorun_tests.exe` / [tests/test_main.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/tests/test_main.cpp)) validates all core invariants, concurrency primitives, race conditions, and edge cases across 21 test suites:
 
 | # | Test Suite Name | Invariant / Edge Case Verified | Status |
 | :-: | :--- | :--- | :-: |
@@ -707,7 +775,7 @@ The test binary (`gorun_tests.exe` / [tests/test_main.cpp](file:///c:/Users/naze
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# 2. Run the 18-suite Unit, Race-Condition & Stress Test Suite
+# 2. Run the 21-suite Unit, Race-Condition & Stress Test Suite
 ctest --test-dir build --output-on-failure
 # or directly:
 .\build\gorun_tests.exe
@@ -737,7 +805,7 @@ All public headers in `include/gorun/` are documented with **English Doxygen / J
 - [include/gorun/detail/stack_pool.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/detail/stack_pool.hpp) — Virtual-memory stack allocator with hardware Guard Pages (`PAGE_NOACCESS` / `PROT_NONE`).
 - [include/gorun/detail/work_stealing_deque.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/detail/work_stealing_deque.hpp) — Per-worker LIFO deque with FIFO half-stealing (`steal_half_into`).
 - [include/gorun/detail/spinlock.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/detail/spinlock.hpp) — TTAS `SpinLock` and O(1) zero-allocation `IntrusiveQueue<Node>`.
-- [tests/test_main.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/tests/test_main.cpp) — 19 unit, race-condition, and M:N work-stealing stress tests.
+- [tests/test_main.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/tests/test_main.cpp) — 21 unit, race-condition, pointer-leak audit, and M:N work-stealing stress tests.
 - [benchmarks/bench_gorun.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/benchmarks/bench_gorun.cpp), [benchmarks/bench_go.go](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/benchmarks/bench_go.go) & [benchmarks/bench_std_alternatives.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/benchmarks/bench_std_alternatives.cpp) — 3-way performance benchmark suite (`gorun` vs. Go vs. Standard C++).
 - [.github/workflows/ci.yml](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/.github/workflows/ci.yml) — Automated GitHub Actions CI/CD pipeline (GCC, Clang, ASan/UBSan, Windows MinGW-w64, CMake install & release packaging).
 - [LICENSE](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/LICENSE) — Apache License, Version 2.0.
