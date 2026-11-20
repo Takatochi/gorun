@@ -727,6 +727,7 @@ public:
                 if (runtime_.shutdown_.load(std::memory_order_acquire) ||
                     !runtime_.global_queue_.empty() || !local_queue_.empty()) {
                     runtime_.sleeping_workers_.fetch_sub(1, std::memory_order_seq_cst);
+                    runtime_.waking_workers_.store(0, std::memory_order_release);
                     continue;
                 }
                 // Check if any sibling worker has stealable work before sleeping
@@ -739,11 +740,16 @@ public:
                 }
                 if (sibling_has_work) {
                     runtime_.sleeping_workers_.fetch_sub(1, std::memory_order_seq_cst);
+                    runtime_.waking_workers_.store(0, std::memory_order_release);
                     continue;
                 }
                 runtime_.sleep_cv_.wait_for(lock, std::chrono::milliseconds(50));
                 runtime_.sleeping_workers_.fetch_sub(1, std::memory_order_seq_cst);
                 runtime_.waking_workers_.store(0, std::memory_order_release);
+                if (!runtime_.global_queue_.empty() &&
+                    runtime_.sleeping_workers_.load(std::memory_order_relaxed) > 0) {
+                    runtime_.sleep_cv_.notify_one();
+                }
                 continue;
             }
 
