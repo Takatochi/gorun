@@ -24,7 +24,7 @@ include(FetchContent)
 FetchContent_Declare(
     gorun
     GIT_REPOSITORY https://github.com/Takatochi/gorun.git
-    GIT_TAG        main # or v0.1.0
+    GIT_TAG        v0.1.0-alpha # or main
 )
 FetchContent_MakeAvailable(gorun)
 
