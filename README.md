@@ -1,10 +1,13 @@
-# `gorun` — High-Performance M:N Green Threads, Channels & Structured Concurrency for C++20/23
+<div align="center">
+  <img src="./docs/logo.png" alt="gorun logo" width="160" style="border-radius: 24px;" />
+  <h1><code>gorun</code> — High-Performance M:N Green Threads, Channels &amp; Structured Concurrency for C++20/23</h1>
+</div>
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 [![C++20 / C++23](https://img.shields.io/badge/C%2B%2B-20%20%7C%2023-00599C?logo=c%2B%2B)](https://en.cppreference.com/w/cpp/20)
 [![Header-Only](https://img.shields.io/badge/Library-Header--Only%20(Zero%20Deps)-success)](#quick-start--installation-how-to-use-gorun-in-your-project)
 [![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions%20(Linux%20%7C%20Windows)-2088FF?logo=github-actions)](./.github/workflows/ci.yml)
-[![Docs Website](https://img.shields.io/badge/Docs-GitHub%20Pages%20Website-38bdf8)](https://takatochi.github.io/gorun/)
+[![Docs & Playground](https://img.shields.io/badge/Docs%20%26%20Live%20Playground-GitHub%20Pages-38bdf8)](https://takatochi.github.io/gorun/)
 
 `gorun` is a header-only, zero-dependency C++20/23 concurrency runtime bringing **Go's M:N work-stealing scheduler (`G-M-P`)**, **isolated stackful routines**, **zero-copy typed channels (`Channel<T>`)**, **`select(...)` multiplexing**, **`GORUN_DEFER`**, and **C++-safe structured concurrency (`Scope` / `TaskGroup`)** to modern C++.
 
