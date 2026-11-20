@@ -46,6 +46,18 @@ endif()
 if(GORUN_BUILD_EXAMPLES)
     add_executable(gorun_demo examples/demo.cpp)
     target_link_libraries(gorun_demo PRIVATE gorun::gorun)
+
+    add_executable(example_01_channels examples/01_channels_and_select.cpp)
+    target_link_libraries(example_01_channels PRIVATE gorun::gorun)
+
+    add_executable(example_02_structured examples/02_structured_concurrency_and_defer.cpp)
+    target_link_libraries(example_02_structured PRIVATE gorun::gorun)
+
+    add_executable(example_03_web_context examples/03_web_microservice_context.cpp)
+    target_link_libraries(example_03_web_context PRIVATE gorun::gorun)
+
+    add_executable(example_04_worker_pool examples/04_worker_pool_and_sync.cpp)
+    target_link_libraries(example_04_worker_pool PRIVATE gorun::gorun)
 endif()
 
 if(GORUN_BUILD_BENCHMARKS)
