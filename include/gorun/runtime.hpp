@@ -2,19 +2,24 @@
 
 /**
  * @file runtime.hpp
- * @brief Core M:N work-stealing scheduler (`Runtime`, `Worker`, `Routine`), timer thread, and `this_routine` namespace.
+ * @brief Core M:N work-stealing scheduler (`Runtime`, `Worker`, `Routine`), cancellable timer thread,
+ *        lock-free `RoutineLocal<T>`, and `this_routine` namespace.
  */
 
 #include <atomic>
 #include <chrono>
+#include <concepts>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
-#include <queue>
+#include <new>
+#include <optional>
 #include <random>
 #include <semaphore>
 #include <stop_token>
@@ -47,7 +52,7 @@ void __sanitizer_finish_switch_fiber(void* fake_stack_save, const void** bottom_
 namespace gorun {
 
 class Runtime;
-class Scope;
+class TaskGroup;
 
 /**
  * @struct Config
@@ -63,7 +68,7 @@ struct Config {
                                    : 4;
 
     /**
-     * @brief Usable virtual-memory stack size per green routine in bytes (default: 128 KB).
+     * @brief Usable virtual-memory stack size per green routine in bytes (default: 128 KB, minimum 16 KB).
      */
     std::size_t default_stack_size = 128 * 1024;
 
@@ -76,6 +81,123 @@ struct Config {
 namespace detail {
 
 class Worker;
+
+/**
+ * @class UniqueTask
+ * @brief C++20 move-only type-erased callable wrapper (`void()`) with 32-byte Small Buffer Optimization (SBO),
+ *        enabling zero-allocation capture of typical lambdas and move-only lambdas (e.g., `std::unique_ptr<T>`)
+ *        in `gorun::go(...)`, `TaskGroup::spawn(...)`, and `go_async(...)`.
+ */
+class UniqueTask {
+    static constexpr std::size_t kInlineSize = 32;
+
+    struct VTable {
+        void (*invoke)(void* storage);
+        void (*move_to)(void* dst, void* src) noexcept;
+        void (*destroy)(void* storage) noexcept;
+    };
+
+    template <typename F>
+    static constexpr bool kFitsInline =
+        sizeof(F) <= kInlineSize &&
+        alignof(F) <= alignof(std::max_align_t) &&
+        std::is_nothrow_move_constructible_v<F>;
+
+    template <typename F>
+    static const VTable* vtable_for() noexcept {
+        if constexpr (kFitsInline<F>) {
+            static constexpr VTable vt{
+                [](void* s) { (*static_cast<F*>(s))(); },
+                [](void* dst, void* src) noexcept {
+                    ::new (dst) F(std::move(*static_cast<F*>(src)));
+                    static_cast<F*>(src)->~F();
+                },
+                [](void* s) noexcept { static_cast<F*>(s)->~F(); }
+            };
+            return &vt;
+        } else {
+            static constexpr VTable vt{
+                [](void* s) {
+                    F* p = nullptr;
+                    std::memcpy(&p, s, sizeof(p));
+                    (*p)();
+                },
+                [](void* dst, void* src) noexcept {
+                    std::memcpy(dst, src, sizeof(F*));
+                },
+                [](void* s) noexcept {
+                    F* p = nullptr;
+                    std::memcpy(&p, s, sizeof(p));
+                    delete p;
+                }
+            };
+            return &vt;
+        }
+    }
+
+    alignas(std::max_align_t) std::byte storage_[kInlineSize];
+    const VTable* vtable_{nullptr};
+
+public:
+    UniqueTask() noexcept = default;
+    UniqueTask(std::nullptr_t) noexcept {}
+
+    template <typename F>
+        requires (!std::same_as<std::decay_t<F>, UniqueTask> && std::invocable<std::decay_t<F>&>)
+    UniqueTask(F&& f) {
+        using Decayed = std::decay_t<F>;
+        if constexpr (kFitsInline<Decayed>) {
+            ::new (static_cast<void*>(storage_)) Decayed(std::forward<F>(f));
+        } else {
+            Decayed* p = new Decayed(std::forward<F>(f));
+            std::memcpy(storage_, &p, sizeof(p));
+        }
+        vtable_ = vtable_for<Decayed>();
+    }
+
+    UniqueTask(UniqueTask&& other) noexcept {
+        if (other.vtable_) {
+            other.vtable_->move_to(storage_, other.storage_);
+            vtable_ = std::exchange(other.vtable_, nullptr);
+        }
+    }
+
+    UniqueTask& operator=(UniqueTask&& other) noexcept {
+        if (this != &other) {
+            reset();
+            if (other.vtable_) {
+                other.vtable_->move_to(storage_, other.storage_);
+                vtable_ = std::exchange(other.vtable_, nullptr);
+            }
+        }
+        return *this;
+    }
+
+    UniqueTask& operator=(std::nullptr_t) noexcept {
+        reset();
+        return *this;
+    }
+
+    ~UniqueTask() noexcept { reset(); }
+
+    UniqueTask(const UniqueTask&) = delete;
+    UniqueTask& operator=(const UniqueTask&) = delete;
+
+    void reset() noexcept {
+        if (vtable_) {
+            vtable_->destroy(storage_);
+            vtable_ = nullptr;
+        }
+    }
+
+    explicit operator bool() const noexcept { return vtable_ != nullptr; }
+
+    void operator()() {
+        if (vtable_) {
+            vtable_->invoke(storage_);
+        }
+    }
+};
 
 /**
  * @enum RoutineState
@@ -93,20 +215,57 @@ enum class RoutineState : std::uint8_t {
  * @brief Internal representation of a lightweight green thread (analogous to `runtime.g` in Go).
  */
 struct Routine {
+    struct LocalSlot {
+        void* ptr{nullptr};
+        void (*deleter)(void*){nullptr};
+
+        LocalSlot() = default;
+        LocalSlot(void* p, void (*d)(void*)) noexcept : ptr(p), deleter(d) {}
+        LocalSlot(const LocalSlot&) = delete;
+        LocalSlot& operator=(const LocalSlot&) = delete;
+        LocalSlot(LocalSlot&& other) noexcept
+            : ptr(std::exchange(other.ptr, nullptr))
+            , deleter(std::exchange(other.deleter, nullptr)) {}
+        LocalSlot& operator=(LocalSlot&& other) noexcept {
+            if (this != &other) {
+                reset();
+                ptr = std::exchange(other.ptr, nullptr);
+                deleter = std::exchange(other.deleter, nullptr);
+            }
+            return *this;
+        }
+        ~LocalSlot() noexcept { reset(); }
+
+        void reset() noexcept {
+            if (ptr && deleter) {
+                deleter(ptr);
+            }
+            ptr = nullptr;
+            deleter = nullptr;
+        }
+    };
+
     std::uint64_t id{0};                        ///< Unique monotonically increasing routine ID
     RoutineState state{RoutineState::Ready};    ///< Current lifecycle state
     ExecutionContext ctx{};                     ///< Saved CPU registers and stack pointer (`%rsp`)
     StackAllocation stack{};                    ///< Virtual-memory stack region with hardware Guard Page
-    std::function<void()> task{};               ///< User callable body
+    UniqueTask task{};                          ///< Move-only user callable body
     std::stop_source stop_source{};             ///< Cooperative cancellation source for this routine
     Runtime* owner_runtime{nullptr};            ///< Owning `Runtime` instance
-    Scope* implicit_scope{nullptr};             ///< Active structured concurrency `Scope` inherited by this routine
+    TaskGroup* implicit_scope{nullptr};         ///< Active structured concurrency `TaskGroup` / `Scope`
+
+    // Per-routine storage for RoutineLocal<T> — automatically destroyed when this routine finishes (zero leaks!)
+    std::unordered_map<std::uint64_t, LocalSlot> routine_locals{};
 
     Routine* prev{nullptr};
     Routine* next{nullptr};
 #if defined(GORUN_HAS_ASAN)
     void* asan_fake_stack{nullptr};
 #endif
+
+    void clear_locals() noexcept {
+        routine_locals.clear();
+    }
 };
 
 inline Worker*& tls_current_worker() noexcept {
@@ -119,8 +278,8 @@ inline Routine*& tls_current_routine() noexcept {
     return r;
 }
 
-inline Scope*& tls_implicit_scope() noexcept {
-    thread_local Scope* s = nullptr;
+inline TaskGroup*& tls_implicit_scope() noexcept {
+    thread_local TaskGroup* s = nullptr;
     return s;
 }
 
@@ -151,9 +310,9 @@ inline Routine* current_routine() noexcept {
 }
 
 /**
- * @brief Returns the active structured concurrency `Scope` (or `TaskGroup`) for the current routine or OS thread.
+ * @brief Returns the active structured concurrency `TaskGroup` (or `Scope`) for the current routine or OS thread.
  */
-inline Scope* current_implicit_scope() noexcept {
+inline TaskGroup* current_implicit_scope() noexcept {
     if (Routine* r = current_routine()) {
         return r->implicit_scope;
     }
@@ -161,9 +320,9 @@ inline Scope* current_implicit_scope() noexcept {
 }
 
 /**
- * @brief Sets the active structured concurrency `Scope` for the current routine or OS thread, returning the previous one.
+ * @brief Sets the active structured concurrency `TaskGroup` for the current routine or OS thread, returning the previous one.
  */
-inline Scope* set_implicit_scope(Scope* s) noexcept {
+inline TaskGroup* set_implicit_scope(TaskGroup* s) noexcept {
     if (Routine* r = current_routine()) {
         return std::exchange(r->implicit_scope, s);
     }
@@ -212,9 +371,9 @@ struct UniversalWaiter {
  * @class Runtime
  * @brief M:N work-stealing green thread runtime.
  *
- * Manages the pool of OS `Worker` threads, the `Global Run Queue`, the `StackPool`, and the background `Timer Thread`.
- * Can be instantiated explicitly for isolated pools (`gorun::Runtime rt(cfg);`) or accessed implicitly via
- * the lazy global singleton `gorun::default_runtime()` whenever `gorun::go(...)` is called.
+ * Manages the pool of OS `Worker` threads, the `Global Run Queue`, the `StackPool`, and the background
+ * cancellable `Timer Thread`. Can be instantiated explicitly for isolated pools (`gorun::Runtime rt(cfg);`)
+ * or accessed implicitly via the lazy global singleton `gorun::default_runtime()` whenever `gorun::go(...)` is called.
  */
 class Runtime {
 private:
@@ -233,22 +392,24 @@ private:
     std::mutex sleep_mutex_;
     std::condition_variable sleep_cv_;
     std::atomic<std::size_t> sleeping_workers_{0};
+    std::atomic<std::uint32_t> waking_workers_{0};
     std::atomic<std::size_t> active_routines_{0};
     std::atomic<bool> shutdown_{false};
 
+    // Cancellable timer queue (O(log N) insert, O(1) earliest peek, O(log N) cancel with zero timer leaks!)
     struct TimerEntry {
-        std::chrono::steady_clock::time_point deadline;
+        std::uint64_t id{0};
         detail::Routine* routine{nullptr};
-        std::function<void()> callback{};
-
-        bool operator>(const TimerEntry& other) const noexcept {
-            return deadline > other.deadline;
-        }
+        detail::UniqueTask callback{};
     };
 
+    using TimerMap = std::multimap<std::chrono::steady_clock::time_point, TimerEntry>;
+
+    std::atomic<std::uint64_t> next_timer_id_{1};
     std::mutex timer_mutex_;
     std::condition_variable timer_cv_;
-    std::priority_queue<TimerEntry, std::vector<TimerEntry>, std::greater<TimerEntry>> timers_;
+    TimerMap timers_;
+    std::unordered_map<std::uint64_t, TimerMap::iterator> timer_index_;
     std::jthread timer_thread_;
 
     std::mutex routine_pool_mutex_;
@@ -256,7 +417,7 @@ private:
 
     static void routine_trampoline(void* arg) noexcept;
 
-    detail::Routine* acquire_routine(std::function<void()> fn);
+    detail::Routine* acquire_routine(detail::UniqueTask fn);
     void release_routine(detail::Routine* r) noexcept;
     void timer_loop();
 
@@ -283,25 +444,34 @@ public:
     void schedule(detail::Routine* r) noexcept;
 
     /**
-     * @brief Registers a timer deadline in the min-heap timer thread to wake routine `r`.
+     * @brief Registers a cancellable timer deadline in the timer thread to wake routine `r`.
+     * @return Unique non-zero timer ID that may be passed to `cancel_timer()`.
      */
-    void schedule_timer(std::chrono::steady_clock::time_point deadline, detail::Routine* r);
+    std::uint64_t schedule_timer(std::chrono::steady_clock::time_point deadline, detail::Routine* r);
 
     /**
-     * @brief Registers an arbitrary callback in the min-heap timer thread at `deadline`.
+     * @brief Registers a cancellable callback in the timer thread at `deadline`.
+     * @return Unique non-zero timer ID that may be passed to `cancel_timer()`.
      */
-    void schedule_timer_callback(std::chrono::steady_clock::time_point deadline, std::function<void()> cb);
+    std::uint64_t schedule_timer_callback(std::chrono::steady_clock::time_point deadline, detail::UniqueTask cb);
 
     /**
-     * @brief Spawns a new green routine on this `Runtime` instance.
+     * @brief Cancels a pending timer by its `timer_id`, immediately reclaiming its memory from the timer map.
+     * @return `true` if the timer was found and cancelled before firing, `false` if already fired or unknown.
+     */
+    bool cancel_timer(std::uint64_t timer_id) noexcept;
+
+    /**
+     * @brief Spawns a new green routine on this `Runtime` instance (supports move-only callables!).
      * @tparam F Callable type `void()`.
      * @param fn Callable task body.
      */
     template <typename F>
     void spawn_raw(F&& fn) {
-        active_routines_.fetch_add(1, std::memory_order_relaxed);
-        detail::Routine* r = acquire_routine(std::forward<F>(fn));
+        // Acquire routine BEFORE incrementing active_routines_ so std::bad_alloc never deadlocks wait_idle()!
+        detail::Routine* r = acquire_routine(detail::UniqueTask(std::forward<F>(fn)));
         r->implicit_scope = detail::current_implicit_scope();
+        active_routines_.fetch_add(1, std::memory_order_relaxed);
         schedule(r);
     }
 
@@ -316,9 +486,11 @@ public:
     }
 
     /**
-     * @brief Spawns `fn` as a main green routine on this runtime and blocks the calling OS thread until it completes.
+     * @brief Spawns `fn` as a green routine on this runtime and waits until it completes.
      *
-     * Any uncaught exception thrown inside `fn` is captured into a `std::exception_ptr` and rethrown to the caller.
+     * Safe to call from BOTH external OS threads (`main()`) and inside existing green routines
+     * (parks the calling green routine via `UniversalWaiter` instead of blocking the OS worker thread!).
+     * Any uncaught exception thrown inside `fn` is captured into `std::exception_ptr` and rethrown.
      *
      * @tparam F Nullary callable type.
      * @param fn Entry function to execute inside the runtime.
@@ -344,6 +516,14 @@ public:
      */
     [[nodiscard]] std::size_t active_routine_count() const noexcept {
         return active_routines_.load(std::memory_order_acquire);
+    }
+
+    /**
+     * @brief Returns the current number of pending (uncancelled) timers in the timer thread.
+     */
+    [[nodiscard]] std::size_t pending_timer_count() noexcept {
+        std::lock_guard lock(timer_mutex_);
+        return timer_index_.size();
     }
 };
 
@@ -375,9 +555,8 @@ class Worker {
     WorkStealingDeque<Routine*> local_queue_{256};
 
     Routine* current_routine_{nullptr};
-    std::vector<std::unique_ptr<Routine>> local_free_routines_{}; ///< Per-worker lock-free routine cache (like Go's `p.gFree`)
+    std::vector<std::unique_ptr<Routine>> local_free_routines_{}; ///< Per-worker lock-free routine cache (Go's `p.gFree`)
     SpinLock* pending_unlock_{nullptr};
-    SpinLock yield_release_lock_{};
     bool yield_requested_{false};
     bool finish_requested_{false};
     std::uint64_t tick_{0};
@@ -469,7 +648,6 @@ public:
         r->state = RoutineState::Finished;
         finish_requested_ = true;
 #if defined(GORUN_HAS_ASAN)
-        // Note: routines in our pool loop forever in routine_trampoline, so their stack stays alive for reuse!
         asan_before_switch_to_scheduler(r, false);
 #endif
         context_switch(&r->ctx, &scheduler_ctx_);
@@ -545,15 +723,27 @@ public:
             }
             if (!r) {
                 std::unique_lock lock(runtime_.sleep_mutex_);
-                if (runtime_.shutdown_.load(std::memory_order_acquire)) {
-                    break;
-                }
-                if (!runtime_.global_queue_.empty() || !local_queue_.empty()) {
+                runtime_.sleeping_workers_.fetch_add(1, std::memory_order_seq_cst);
+                if (runtime_.shutdown_.load(std::memory_order_acquire) ||
+                    !runtime_.global_queue_.empty() || !local_queue_.empty()) {
+                    runtime_.sleeping_workers_.fetch_sub(1, std::memory_order_seq_cst);
                     continue;
                 }
-                runtime_.sleeping_workers_.fetch_add(1, std::memory_order_seq_cst);
-                runtime_.sleep_cv_.wait_for(lock, std::chrono::milliseconds(1));
+                // Check if any sibling worker has stealable work before sleeping
+                bool sibling_has_work = false;
+                for (const auto& w : runtime_.workers_) {
+                    if (w.get() != this && !w->local_queue_.empty()) {
+                        sibling_has_work = true;
+                        break;
+                    }
+                }
+                if (sibling_has_work) {
+                    runtime_.sleeping_workers_.fetch_sub(1, std::memory_order_seq_cst);
+                    continue;
+                }
+                runtime_.sleep_cv_.wait_for(lock, std::chrono::milliseconds(50));
                 runtime_.sleeping_workers_.fetch_sub(1, std::memory_order_seq_cst);
+                runtime_.waking_workers_.store(0, std::memory_order_release);
                 continue;
             }
 
@@ -579,8 +769,8 @@ public:
 
             if (yield_requested_) {
                 yield_requested_ = false;
-                // Keep on local queue if no other workers are starving, or push to local_queue_
-                local_queue_.push_back(r);
+                // Push to FIFO head so other queued local routines run before this routine (prevents LIFO starvation)
+                local_queue_.push_front(r);
             } else if (finish_requested_) {
                 finish_requested_ = false;
                 runtime_.release_routine(r);
@@ -625,24 +815,20 @@ inline void Runtime::routine_trampoline(void* arg) noexcept {
     detail::current_worker()->asan_after_switch_to_routine(r);
 #endif
     for (;;) {
-        detail::Worker* w_entry = detail::current_worker();
-        if (w_entry->pending_unlock_) {
-            detail::SpinLock* lk = std::exchange(w_entry->pending_unlock_, nullptr);
-            lk->unlock();
-        }
-
         try {
             if (r->task) {
                 r->task();
             }
         } catch (...) {
         }
+        // Destroy captured closure & all RoutineLocal<T> instances immediately before recycling!
         r->task = nullptr;
+        r->clear_locals();
         detail::current_worker()->finish_current();
     }
 }
 
-inline detail::Routine* Runtime::acquire_routine(std::function<void()> fn) {
+inline detail::Routine* Runtime::acquire_routine(detail::UniqueTask fn) {
     std::unique_ptr<detail::Routine> r;
     detail::Worker* w = detail::current_worker();
     if (w && &w->runtime() == this && !w->local_free_routines().empty()) {
@@ -746,32 +932,70 @@ inline Runtime::~Runtime() {
 
 inline void Runtime::schedule(detail::Routine* r) noexcept {
     r->state = detail::RoutineState::Ready;
+    bool should_wake = false;
     detail::Worker* w = detail::current_worker();
     if (w && &w->runtime() == this) {
-        w->local_queue_.push_run_next(r);
+        // Only wake an idle sibling core if this worker now has >=2 local runnable routines;
+        // keeping single-task producer-consumer handoffs in run_next_ preserves L1 cache locality.
+        should_wake = w->local_queue_.push_run_next(r);
     } else {
         global_queue_.push_back(r);
+        should_wake = true;
     }
 
-    if (sleeping_workers_.load(std::memory_order_relaxed) > 0) {
-        sleep_cv_.notify_one();
+    if (should_wake) {
+        // Full fence pairs with sleeping_workers_.fetch_add(seq_cst) in Worker::run_loop() to prevent lost wakeups!
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (sleeping_workers_.load(std::memory_order_seq_cst) > 0 &&
+            waking_workers_.exchange(1, std::memory_order_acq_rel) == 0) {
+            std::lock_guard lk(sleep_mutex_);
+            sleep_cv_.notify_one();
+        }
     }
 }
 
-inline void Runtime::schedule_timer(std::chrono::steady_clock::time_point deadline, detail::Routine* r) {
+inline std::uint64_t Runtime::schedule_timer(std::chrono::steady_clock::time_point deadline, detail::Routine* r) {
+    std::uint64_t id = next_timer_id_.fetch_add(1, std::memory_order_relaxed);
+    bool is_earliest = false;
     {
         std::lock_guard lock(timer_mutex_);
-        timers_.push(TimerEntry{.deadline = deadline, .routine = r, .callback = nullptr});
+        auto it = timers_.emplace(deadline, TimerEntry{.id = id, .routine = r, .callback = nullptr});
+        timer_index_.emplace(id, it);
+        is_earliest = (it == timers_.begin());
     }
-    timer_cv_.notify_one();
+    if (is_earliest) {
+        timer_cv_.notify_one();
+    }
+    return id;
 }
 
-inline void Runtime::schedule_timer_callback(std::chrono::steady_clock::time_point deadline, std::function<void()> cb) {
+inline std::uint64_t Runtime::schedule_timer_callback(std::chrono::steady_clock::time_point deadline, detail::UniqueTask cb) {
+    std::uint64_t id = next_timer_id_.fetch_add(1, std::memory_order_relaxed);
+    bool is_earliest = false;
     {
         std::lock_guard lock(timer_mutex_);
-        timers_.push(TimerEntry{.deadline = deadline, .routine = nullptr, .callback = std::move(cb)});
+        auto it = timers_.emplace(deadline, TimerEntry{.id = id, .routine = nullptr, .callback = std::move(cb)});
+        timer_index_.emplace(id, it);
+        is_earliest = (it == timers_.begin());
     }
-    timer_cv_.notify_one();
+    if (is_earliest) {
+        timer_cv_.notify_one();
+    }
+    return id;
+}
+
+inline bool Runtime::cancel_timer(std::uint64_t timer_id) noexcept {
+    if (timer_id == 0) {
+        return false;
+    }
+    std::lock_guard lock(timer_mutex_);
+    auto idx_it = timer_index_.find(timer_id);
+    if (idx_it == timer_index_.end()) {
+        return false;
+    }
+    timers_.erase(idx_it->second);
+    timer_index_.erase(idx_it);
+    return true;
 }
 
 inline void Runtime::timer_loop() {
@@ -785,9 +1009,11 @@ inline void Runtime::timer_loop() {
         }
 
         auto now = std::chrono::steady_clock::now();
-        if (timers_.top().deadline <= now) {
-            TimerEntry entry = std::move(const_cast<TimerEntry&>(timers_.top()));
-            timers_.pop();
+        auto earliest = timers_.begin();
+        if (earliest->first <= now) {
+            TimerEntry entry = std::move(earliest->second);
+            timer_index_.erase(entry.id);
+            timers_.erase(earliest);
             lock.unlock();
 
             if (entry.routine) {
@@ -798,7 +1024,7 @@ inline void Runtime::timer_loop() {
 
             lock.lock();
         } else {
-            auto next_deadline = timers_.top().deadline;
+            auto next_deadline = earliest->first;
             timer_cv_.wait_until(lock, next_deadline);
         }
     }
@@ -814,8 +1040,32 @@ inline void Runtime::wait_idle() noexcept {
 template <std::invocable F>
 auto Runtime::block_on(F&& fn) -> std::invoke_result_t<F> {
     using R = std::invoke_result_t<F>;
-    std::binary_semaphore done_sem{0};
+    detail::SpinLock done_lock;
+    bool is_done = false;
+    detail::UniversalWaiter* waiter_ptr = nullptr;
     std::exception_ptr exc{nullptr};
+
+    auto notify_done = [&]() noexcept {
+        done_lock.lock();
+        is_done = true;
+        detail::UniversalWaiter* w = waiter_ptr;
+        done_lock.unlock();
+        if (w) {
+            w->unpark();
+        }
+    };
+
+    auto wait_done = [&]() noexcept {
+        done_lock.lock();
+        if (!is_done) {
+            std::binary_semaphore fallback_sem{0};
+            auto waiter = detail::UniversalWaiter::make_for_current(fallback_sem);
+            waiter_ptr = &waiter;
+            waiter.park_current(done_lock);
+        } else {
+            done_lock.unlock();
+        }
+    };
 
     if constexpr (std::is_void_v<R>) {
         spawn_raw([&, f = std::forward<F>(fn)]() mutable {
@@ -824,9 +1074,9 @@ auto Runtime::block_on(F&& fn) -> std::invoke_result_t<F> {
             } catch (...) {
                 exc = std::current_exception();
             }
-            done_sem.release();
+            notify_done();
         });
-        done_sem.acquire();
+        wait_done();
         if (exc) {
             std::rethrow_exception(exc);
         }
@@ -838,9 +1088,9 @@ auto Runtime::block_on(F&& fn) -> std::invoke_result_t<F> {
             } catch (...) {
                 exc = std::current_exception();
             }
-            done_sem.release();
+            notify_done();
         });
-        done_sem.acquire();
+        wait_done();
         if (exc) {
             std::rethrow_exception(exc);
         }
@@ -883,10 +1133,11 @@ void sleep_for(std::chrono::duration<Rep, Period> duration) {
         detail::Routine* r = detail::current_routine();
         detail::SpinLock timer_park_lock;
         timer_park_lock.lock();
-        w->runtime().schedule_timer_callback(deadline, [w, r, &timer_park_lock]() {
+        Runtime* rt = &w->runtime();
+        rt->schedule_timer_callback(deadline, [rt, r, &timer_park_lock]() {
             timer_park_lock.lock();
             timer_park_lock.unlock();
-            w->runtime().schedule(r);
+            rt->schedule(r);
         });
         w->park_locked(timer_park_lock);
     } else {
@@ -933,26 +1184,57 @@ void sleep_for(std::chrono::duration<Rep, Period> duration) {
 
 /**
  * @class RoutineLocal
- * @brief Routine-local storage container isolated per green routine ID (safe replacement for `thread_local`).
+ * @brief Lock-free, zero-leak routine-local storage container isolated per green routine
+ *        (safe replacement for `thread_local`).
  *
- * Because a green routine can migrate across different OS `Worker` threads after `park()` / `yield()`,
- * standard C++ `thread_local` variables may change mid-function. `RoutineLocal<T>` binds state to `this_routine::id()`.
+ * Values are stored directly on the owning `Routine` and automatically destroyed the instant
+ * the routine finishes — preventing unbounded memory growth in long-running web servers.
+ * External OS threads automatically fall back to thread-safe `thread_local` storage.
  *
- * @tparam T Value type stored per routine.
+ * @tparam T Default-constructible value type stored per routine.
  */
 template <typename T>
 class RoutineLocal {
-    detail::SpinLock lock_;
-    std::unordered_map<std::uint64_t, T> storage_;
+    static std::atomic<std::uint64_t>& next_key_id() noexcept {
+        static std::atomic<std::uint64_t> counter{1};
+        return counter;
+    }
+
+    static void destroy_value(void* ptr) noexcept {
+        delete static_cast<T*>(ptr);
+    }
+
+    const std::uint64_t key_id_;
 
 public:
+    RoutineLocal() noexcept
+        : key_id_(next_key_id().fetch_add(1, std::memory_order_relaxed)) {}
+
+    RoutineLocal(const RoutineLocal&) = delete;
+    RoutineLocal& operator=(const RoutineLocal&) = delete;
+
     /**
-     * @brief Returns a reference to the `T` instance owned by the current green routine.
+     * @brief Returns a reference to the `T` instance owned by the current green routine (lock-free!)
+     *        or the current external OS thread.
      */
     T& get() {
-        std::uint64_t rid = this_routine::id();
-        std::lock_guard g(lock_);
-        return storage_[rid];
+        if (detail::Routine* r = detail::current_routine()) {
+            auto& slot = r->routine_locals[key_id_];
+            if (!slot.ptr) {
+                slot.ptr = new T{};
+                slot.deleter = &destroy_value;
+            }
+            return *static_cast<T*>(slot.ptr);
+        }
+
+        // External OS thread fallback: strictly isolated per OS thread (zero data race!)
+        thread_local std::unordered_map<std::uint64_t, detail::Routine::LocalSlot> os_thread_locals;
+        auto& slot = os_thread_locals[key_id_];
+        if (!slot.ptr) {
+            slot.ptr = new T{};
+            slot.deleter = &destroy_value;
+        }
+        return *static_cast<T*>(slot.ptr);
     }
 
     T& operator*() { return get(); }

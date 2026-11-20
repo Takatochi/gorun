@@ -5,7 +5,8 @@
  * @brief Ultra-fast user-space CPU execution context (`ExecutionContext`) and assembly stack switching.
  *
  * Supports cross-thread migration of green routines across M:N OS worker threads (Work-Stealing)
- * on both Windows x64 ABI (saving GPRs, XMM6–XMM15, and `NT_TIB` stack limits) and System V AMD64 ABI (Linux/macOS).
+ * on both Windows x64 ABI (saving GPRs, XMM6–XMM15, MXCSR, x87 FCW, and `NT_TIB` stack limits)
+ * and System V AMD64 ABI (Linux/macOS, saving GPRs, MXCSR, and x87 FCW).
  */
 
 #include <atomic>
@@ -15,10 +16,17 @@
 
 namespace gorun::detail {
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER) && !defined(__clang__)
+#error "gorun requires a GNU/Clang inline-assembly compatible compiler (GCC, Clang, or MinGW-w64) on x86_64."
+#elif defined(__x86_64__) || defined(_M_X64)
 
 extern "C" void gorun_context_switch_asm(void** from_rsp, void** to_rsp) noexcept;
 extern "C" void gorun_routine_entry_asm() noexcept;
+
+// Default IEEE-754 MXCSR (0x1F80: all SSE exceptions masked, round-to-nearest)
+// combined with default x87 FPU control word (0x037F: all x87 exceptions masked, 64-bit precision)
+inline constexpr std::uint64_t kDefaultFpuMxcsrState =
+    (static_cast<std::uint64_t>(0x037Fu) << 32) | 0x1F80u;
 
 #if defined(_WIN32)
 __asm__(
@@ -34,15 +42,14 @@ __asm__(
     "  pushq %r14\n"
     "  pushq %r15\n"
     // Save Windows NT_TIB stack bounds (StackBase=gs:0x08, StackLimit=gs:0x10, DeallocationStack=gs:0x1478)
-    // Required for SEH & C++ exception unwinding across migrated worker threads
     "  movq %gs:0x08, %rax\n"
     "  pushq %rax\n"
     "  movq %gs:0x10, %rax\n"
     "  pushq %rax\n"
     "  movq %gs:0x1478, %rax\n"
     "  pushq %rax\n"
-    // Save callee-saved XMM6..XMM15 registers (160 bytes) per Windows x64 ABI
-    "  subq $160, %rsp\n"
+    // Save callee-saved XMM6..XMM15 (160 bytes) + MXCSR (4 bytes) + x87 FCW (2 bytes) = 168 bytes
+    "  subq $168, %rsp\n"
     "  movups %xmm6,   0(%rsp)\n"
     "  movups %xmm7,  16(%rsp)\n"
     "  movups %xmm8,  32(%rsp)\n"
@@ -53,10 +60,12 @@ __asm__(
     "  movups %xmm13, 112(%rsp)\n"
     "  movups %xmm14, 128(%rsp)\n"
     "  movups %xmm15, 144(%rsp)\n"
+    "  stmxcsr 160(%rsp)\n"
+    "  fnstcw  164(%rsp)\n"
     // Switch stack pointer RSP: rcx = from_rsp, rdx = to_rsp
     "  movq %rsp, (%rcx)\n"
     "  movq (%rdx), %rsp\n"
-    // Restore XMM6..XMM15
+    // Restore XMM6..XMM15 + MXCSR + x87 FCW
     "  movups   0(%rsp), %xmm6\n"
     "  movups  16(%rsp), %xmm7\n"
     "  movups  32(%rsp), %xmm8\n"
@@ -67,7 +76,9 @@ __asm__(
     "  movups 112(%rsp), %xmm13\n"
     "  movups 128(%rsp), %xmm14\n"
     "  movups 144(%rsp), %xmm15\n"
-    "  addq $160, %rsp\n"
+    "  ldmxcsr 160(%rsp)\n"
+    "  fldcw   164(%rsp)\n"
+    "  addq $168, %rsp\n"
     // Restore Windows NT_TIB stack bounds on the target OS thread
     "  popq %rax\n"
     "  movq %rax, %gs:0x1478\n"
@@ -96,15 +107,23 @@ __asm__(
 __asm__(
     ".text\n"
     ".globl gorun_context_switch_asm\n"
+    ".type gorun_context_switch_asm, @function\n"
     "gorun_context_switch_asm:\n"
+    "  .cfi_startproc\n"
     "  pushq %rbp\n"
     "  pushq %rbx\n"
     "  pushq %r12\n"
     "  pushq %r13\n"
     "  pushq %r14\n"
     "  pushq %r15\n"
+    "  subq $8, %rsp\n"
+    "  stmxcsr 0(%rsp)\n"
+    "  fnstcw  4(%rsp)\n"
     "  movq %rsp, (%rdi)\n"
     "  movq (%rsi), %rsp\n"
+    "  ldmxcsr 0(%rsp)\n"
+    "  fldcw   4(%rsp)\n"
+    "  addq $8, %rsp\n"
     "  popq %r15\n"
     "  popq %r14\n"
     "  popq %r13\n"
@@ -112,12 +131,16 @@ __asm__(
     "  popq %rbx\n"
     "  popq %rbp\n"
     "  retq\n"
+    "  .cfi_endproc\n"
     ".globl gorun_routine_entry_asm\n"
+    ".type gorun_routine_entry_asm, @function\n"
     "gorun_routine_entry_asm:\n"
-    "  subq $8, %rsp\n" // Align RSP so that inside `callq *%r13`, RSP % 16 == 8 (System V AMD64 ABI requirement for SSE/movaps!)
+    "  .cfi_startproc\n"
+    "  subq $8, %rsp\n" // Align RSP so inside `callq *%r13`, RSP % 16 == 8 (System V AMD64 ABI)
     "  movq %r12, %rdi\n"
     "  callq *%r13\n"
     "  ud2\n"
+    "  .cfi_endproc\n"
 );
 #endif
 
@@ -162,10 +185,15 @@ struct ExecutionContext {
         *(--sp) = reinterpret_cast<std::uint64_t>(stack.stack_top);       // gs:0x08 StackBase
         *(--sp) = reinterpret_cast<std::uint64_t>(stack.stack_bottom);    // gs:0x10 StackLimit
         *(--sp) = reinterpret_cast<std::uint64_t>(stack.base_allocation); // gs:0x1478 DeallocationStack
-        // 160 bytes (20 * uint64_t) for XMM6..XMM15
+        // MXCSR + x87 FCW slot at 160(%rsp)
+        *(--sp) = kDefaultFpuMxcsrState;
+        // 160 bytes (20 * uint64_t) for XMM6..XMM15 at 0..144(%rsp)
         for (int i = 0; i < 20; ++i) {
             *(--sp) = 0;
         }
+#else
+        // MXCSR + x87 FCW slot at 0(%rsp)
+        *(--sp) = kDefaultFpuMxcsrState;
 #endif
         rsp = sp;
     }
@@ -192,6 +220,8 @@ inline void context_switch(ExecutionContext* from, ExecutionContext* to) noexcep
     std::atomic_signal_fence(std::memory_order_seq_cst);
 }
 
+#else
+#error "gorun: unsupported CPU architecture (x86_64 is currently required)."
 #endif
 
 } // namespace gorun::detail

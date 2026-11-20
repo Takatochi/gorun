@@ -5,9 +5,11 @@
  * @brief Virtual memory stack allocator and recycling pool (`StackPool`) with hardware Guard Pages.
  */
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <vector>
@@ -52,6 +54,8 @@ struct StackAllocation {
  * by caching completed routine stacks in LIFO order.
  */
 class StackPool {
+    static constexpr std::size_t kMinStackBytes = 16 * 1024; ///< Minimum safe usable stack size (16 KB)
+
     std::size_t default_usable_size_;
     std::size_t max_pooled_;
     mutable std::mutex mutex_;
@@ -64,9 +68,10 @@ class StackPool {
 #if defined(_WIN32)
         SYSTEM_INFO si;
         GetSystemInfo(&si);
-        return static_cast<std::size_t>(si.dwPageSize);
+        return si.dwPageSize > 0 ? static_cast<std::size_t>(si.dwPageSize) : 4096;
 #else
-        return static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+        long sz = ::sysconf(_SC_PAGESIZE);
+        return sz > 0 ? static_cast<std::size_t>(sz) : 4096;
 #endif
     }
 
@@ -76,12 +81,16 @@ class StackPool {
 
     /**
      * @brief Allocates a fresh stack from OS virtual memory and marks the lowest page as `PAGE_NOACCESS` / `PROT_NONE`.
-     * @param requested_usable Requested usable stack size in bytes.
-     * @throws std::bad_alloc If OS virtual memory allocation fails.
+     * @param requested_usable Requested usable stack size in bytes (clamped to >= 16 KB, overflow-checked).
+     * @throws std::bad_alloc If OS virtual memory allocation fails or size overflows.
      */
     static StackAllocation os_allocate(std::size_t requested_usable) {
         const std::size_t pg = page_size();
-        const std::size_t usable = align_up(requested_usable, pg);
+        const std::size_t clamped = std::max(requested_usable, kMinStackBytes);
+        if (clamped > std::numeric_limits<std::size_t>::max() - 2 * pg) {
+            throw std::bad_alloc();
+        }
+        const std::size_t usable = align_up(clamped, pg);
         const std::size_t total = usable + pg; // +1 page at the bottom for hardware Guard Page
 
 #if defined(_WIN32)
@@ -126,11 +135,11 @@ class StackPool {
 public:
     /**
      * @brief Constructs a `StackPool`.
-     * @param default_usable_size Default usable stack size per routine in bytes (default: 128 KB).
+     * @param default_usable_size Default usable stack size per routine in bytes (default: 128 KB, minimum 16 KB).
      * @param max_pooled Maximum number of idle stacks retained in the pool before returning memory to the OS.
      */
     explicit StackPool(std::size_t default_usable_size = 128 * 1024, std::size_t max_pooled = 1024)
-        : default_usable_size_(default_usable_size)
+        : default_usable_size_(std::max(default_usable_size, kMinStackBytes))
         , max_pooled_(max_pooled) {}
 
     ~StackPool() {

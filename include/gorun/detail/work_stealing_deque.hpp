@@ -63,18 +63,20 @@ public:
     /**
      * @brief Places `item` into the hot `run_next_` slot (like Go's `runqput(..., next=true)`).
      * If `run_next_` was already occupied, the displaced routine is pushed to the tail of the circular buffer.
+     * @return `true` if a previous routine was displaced (meaning >=2 tasks are queued locally), `false` otherwise.
      */
-    void push_run_next(T item) {
+    bool push_run_next(T item) {
         std::lock_guard guard(lock_);
         if (!run_next_) {
             run_next_ = item;
-            return;
+            return count_ > 0;
         }
         T displaced = std::exchange(run_next_, item);
         grow_if_needed();
         buffer_[tail_] = displaced;
         tail_ = (tail_ + 1) % buffer_.size();
         ++count_;
+        return true;
     }
 
     /**
@@ -86,6 +88,19 @@ public:
         grow_if_needed();
         buffer_[tail_] = item;
         tail_ = (tail_ + 1) % buffer_.size();
+        ++count_;
+    }
+
+    /**
+     * @brief Pushes a yielded routine to the head of the deque (FIFO fair placement) so other queued
+     *        routines run before it on LIFO `pop_back()`, preventing self-starvation on `yield()`.
+     * @param item Routine pointer to enqueue.
+     */
+    void push_front(T item) {
+        std::lock_guard guard(lock_);
+        grow_if_needed();
+        head_ = (head_ + buffer_.size() - 1) % buffer_.size();
+        buffer_[head_] = item;
         ++count_;
     }
 
