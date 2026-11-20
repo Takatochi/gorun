@@ -16,7 +16,6 @@ import re
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 INCLUDE_DIR = ROOT / "include"
 OUTPUT = ROOT / "single_include" / "gorun" / "gorun.hpp"
-DOCS_OUTPUT = ROOT / "docs" / "gorun.hpp"
 LOCAL_INCLUDE = re.compile(r'^\s*#\s*include\s*"(gorun/[^"]+)"\s*$')
 
 _seen: set[str] = set()
@@ -58,11 +57,9 @@ HEADER = """#pragma once
 
 def main() -> None:
     body = expand("gorun/gorun.hpp")
-    content = HEADER + body + "\n"
-    for out_path in (OUTPUT, DOCS_OUTPUT):
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(content, encoding="utf-8", newline="\n")
-        print(f"Wrote {out_path.relative_to(ROOT)} ({len(_seen)} headers inlined)")
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT.write_text(HEADER + body + "\n", encoding="utf-8", newline="\n")
+    print(f"Wrote {OUTPUT.relative_to(ROOT)} ({len(_seen)} headers inlined)")
 
 
 if __name__ == "__main__":

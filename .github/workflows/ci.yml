@@ -83,11 +83,19 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Package Header-Only Release Archive
+      - name: Package Header-Only Release Archive & Extract Changelog
         run: |
           mkdir -p dist/gorun
           cp -r include single_include cmake CMakeLists.txt LICENSE README.md CHANGELOG.md dist/gorun/
           cp single_include/gorun/gorun.hpp dist/gorun-${GITHUB_REF_NAME}-single-header.hpp
+          python3 -c '
+          import os, re, pathlib
+          tag = os.environ["GITHUB_REF_NAME"]
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          m = re.search(rf"^## \[{re.escape(tag)}\].*?(?=^## \[|\Z)", text, re.M | re.S)
+          notes = m.group(0).strip() if m else text.strip()
+          pathlib.Path("dist/release_notes.md").write_text(notes + "\n", encoding="utf-8")
+          '
           cd dist
           tar -czvf gorun-${GITHUB_REF_NAME}-header-only.tar.gz gorun
           zip -r gorun-${GITHUB_REF_NAME}-header-only.zip gorun
@@ -96,7 +104,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: gorun ${{ github.ref_name }}
-          body_path: RELEASE_NOTES.md
+          body_path: dist/release_notes.md
           files: |
             dist/gorun-${{ github.ref_name }}-single-header.hpp
             dist/gorun-${{ github.ref_name }}-header-only.tar.gz

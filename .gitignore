@@ -5,6 +5,9 @@ out/
 dist/
 install_prefix/
 
+# Generated docs staging copy (copied automatically by pages.yml from single_include/)
+docs/gorun.hpp
+
 # Compiled binaries and objects
 *.exe
 *.obj
