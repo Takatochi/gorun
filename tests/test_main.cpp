@@ -870,12 +870,208 @@ void test_21_go_style_context_tree_and_timeout() {
     std::cout << "PASSED\n";
 }
 
+// 22. Move-only lambdas capturing std::unique_ptr in go(), TaskGroup::spawn(), and go_async()
+void test_22_move_only_lambdas_and_unique_task() {
+    std::cout << "[TEST 22] Move-only lambdas (std::unique_ptr capture) via UniqueTask... ";
+
+    std::atomic<int> sum{0};
+    {
+        gorun::Scope scope;
+        auto p1 = std::make_unique<int>(42);
+        gorun::go([p = std::move(p1), &sum]() {
+            sum.fetch_add(*p, std::memory_order_relaxed);
+        });
+
+        auto p2 = std::make_unique<int>(100);
+        scope.spawn([p = std::move(p2), &sum]() {
+            sum.fetch_add(*p, std::memory_order_relaxed);
+        });
+    }
+
+    auto p3 = std::make_unique<int>(7);
+    auto handle = gorun::go_async([p = std::move(p3)]() {
+        return (*p) * 6;
+    });
+    int async_val = handle.get();
+
+    GORUN_TEST_ASSERT(sum.load() == 142);
+    GORUN_TEST_ASSERT(async_val == 42);
+    std::cout << "PASSED\n";
+}
+
+// 23. Context zero-leak tree cleanup, timer cancellation, and read-only DoneChannelView
+void test_23_context_zero_leak_and_timer_cancel() {
+    std::cout << "[TEST 23] Context zero-leak children/timers & read-only DoneChannelView... ";
+
+    auto bg = gorun::background();
+    GORUN_TEST_ASSERT(bg.active_children_count() == 0);
+
+    // Compile-time check: ctx.done() must be read-only (no close() method)
+    constexpr bool has_close = []<typename T>(T*) {
+        return requires(T d) { d.close(); };
+    }(static_cast<std::decay_t<decltype(bg.done())>*>(nullptr));
+    static_assert(!has_close, "DoneChannelView must not expose close()");
+    GORUN_TEST_ASSERT(!bg.done().is_closed());
+
+    // 23.1. Create and immediately cancel 500 long-lived timeout contexts under background()
+    for (int i = 0; i < 500; ++i) {
+        auto val_ctx = gorun::with_value(bg, "iter", i);
+        auto [t_ctx, cancel] = gorun::with_timeout(val_ctx, 30s);
+        GORUN_TEST_ASSERT(!t_ctx.done().is_closed());
+        cancel();
+        GORUN_TEST_ASSERT(t_ctx.done().is_closed());
+    }
+    GORUN_TEST_ASSERT(bg.active_children_count() == 0);
+    GORUN_TEST_ASSERT(gorun::default_runtime().pending_timer_count() == 0);
+
+    // 23.2. Child contexts under a cancellable parent must auto-detach when cancelled or destroyed
+    {
+        auto [parent, p_cancel] = gorun::with_cancel(bg);
+        GORUN_DEFER { p_cancel(); };
+        for (int i = 0; i < 200; ++i) {
+            auto [child, c_cancel] = gorun::with_timeout(parent, 30s);
+            if (i % 2 == 0) {
+                c_cancel();
+            }
+            // Odd children simply go out of scope and detach in ~ContextNode()!
+        }
+        GORUN_TEST_ASSERT(parent.active_children_count() == 0);
+        GORUN_TEST_ASSERT(gorun::default_runtime().pending_timer_count() == 0);
+    }
+
+    std::cout << "PASSED\n";
+}
+
+// 24. RoutineLocal<T> zero memory leak on routine exit & race-free external OS thread isolation
+void test_24_routine_local_zero_leak_and_os_threads() {
+    std::cout << "[TEST 24] RoutineLocal<T> zero leak on routine exit & OS-thread isolation... ";
+
+    TrackedObject::live_instances.store(0);
+    TrackedObject::total_constructed.store(0);
+    TrackedObject::total_destroyed.store(0);
+
+    gorun::RoutineLocal<TrackedObject> tracked_local;
+    {
+        gorun::Scope scope;
+        for (int i = 1; i <= 100; ++i) {
+            gorun::go([&, i]() {
+                tracked_local->payload = i * 3;
+                gorun::yield();
+                GORUN_TEST_ASSERT(tracked_local->payload == i * 3);
+            });
+        }
+    }
+
+    GORUN_TEST_ASSERT(TrackedObject::live_instances.load() == 0);
+    GORUN_TEST_ASSERT(TrackedObject::total_constructed.load() == 100);
+    GORUN_TEST_ASSERT(TrackedObject::total_destroyed.load() == 100);
+
+    // Verify 2 external OS threads do not race on RoutineLocal<int>
+    gorun::RoutineLocal<int> os_local;
+    std::atomic<bool> ok1{true};
+    std::atomic<bool> ok2{true};
+    {
+        std::jthread t1([&]() {
+            *os_local = 111;
+            for (int i = 0; i < 1000; ++i) {
+                *os_local += 1;
+                std::this_thread::yield();
+            }
+            ok1.store(*os_local == 1111);
+        });
+        std::jthread t2([&]() {
+            *os_local = 5000;
+            for (int i = 0; i < 1000; ++i) {
+                *os_local += 2;
+                std::this_thread::yield();
+            }
+            ok2.store(*os_local == 7000);
+        });
+    }
+    GORUN_TEST_ASSERT(ok1.load() && ok2.load());
+
+    std::cout << "PASSED\n";
+}
+
+// 25. Channel exception safety (no SpinLock leak), parked select() + closed channel, and nested block_on()
+struct ThrowingMovePayload {
+    int value{0};
+    bool should_throw{false};
+
+    ThrowingMovePayload(int v = 0, bool t = false) noexcept : value(v), should_throw(t) {}
+    ThrowingMovePayload(const ThrowingMovePayload&) = default;
+    ThrowingMovePayload& operator=(const ThrowingMovePayload&) = default;
+    ThrowingMovePayload(ThrowingMovePayload&& other) : value(other.value), should_throw(other.should_throw) {
+        if (should_throw) {
+            throw std::runtime_error("Simulated move constructor failure");
+        }
+    }
+    ThrowingMovePayload& operator=(ThrowingMovePayload&& other) {
+        if (other.should_throw) {
+            throw std::runtime_error("Simulated move assignment failure");
+        }
+        value = other.value;
+        should_throw = other.should_throw;
+        return *this;
+    }
+};
+
+void test_25_channel_exception_safety_parked_select_and_nested_block_on() {
+    std::cout << "[TEST 25] Channel exception safety, parked select() on close, & nested block_on()... ";
+
+    // 25.1. Throwing move constructor inside Channel::send() must NOT deadlock the SpinLock
+    gorun::Channel<ThrowingMovePayload> ex_ch(4);
+    bool caught = false;
+    try {
+        ex_ch.send(ThrowingMovePayload{99, true});
+    } catch (const std::runtime_error&) {
+        caught = true;
+    }
+    GORUN_TEST_ASSERT(caught);
+    GORUN_TEST_ASSERT(ex_ch.send(ThrowingMovePayload{77, false}));
+    auto got = ex_ch.recv();
+    GORUN_TEST_ASSERT(got.has_value() && got->value == 77);
+
+    // 25.2. Parked select() waking cleanly when a channel is closed by another routine
+    gorun::Channel<int> close_ch(0);
+    bool woke_closed = false;
+    {
+        gorun::Scope scope;
+        gorun::go([&]() {
+            gorun::sleep_for(8ms);
+            close_ch.close();
+        });
+        gorun::select(
+            close_ch.on_recv([&](std::optional<int> v) {
+                woke_closed = !v.has_value();
+            }),
+            gorun::on_timeout(200ms, []() {
+                GORUN_TEST_ASSERT(false);
+            })
+        );
+    }
+    GORUN_TEST_ASSERT(woke_closed);
+    GORUN_TEST_ASSERT(gorun::default_runtime().pending_timer_count() == 0);
+
+    // 25.3. Nested Runtime::block_on() inside a green routine on a 1-worker Runtime must NOT deadlock
+    gorun::Runtime single_rt(gorun::Config{.worker_count = 1});
+    int nested_res = single_rt.block_on([&]() {
+        return single_rt.block_on([]() {
+            gorun::yield();
+            return 1234;
+        });
+    });
+    GORUN_TEST_ASSERT(nested_res == 1234);
+
+    std::cout << "PASSED\n";
+}
+
 int main() {
     std::cout << std::unitbuf;
     auto t0 = std::chrono::steady_clock::now();
 
     std::cout << "======================================================================\n";
-    std::cout << "  gorun C++20 M:N Green Threads Runtime — 21 Comprehensive Test Suites\n";
+    std::cout << "  gorun C++20 M:N Green Threads Runtime — 25 Comprehensive Test Suites\n";
     std::cout << "  Active OS Worker Threads: " << gorun::default_runtime().worker_count() << "\n";
     std::cout << "======================================================================\n";
 
@@ -900,13 +1096,17 @@ int main() {
     test_19_defer_lifo_and_exception_cleanup();
     test_20_zero_lost_pointers_and_lifetime_audit();
     test_21_go_style_context_tree_and_timeout();
+    test_22_move_only_lambdas_and_unique_task();
+    test_23_context_zero_leak_and_timer_cancel();
+    test_24_routine_local_zero_leak_and_os_threads();
+    test_25_channel_exception_safety_parked_select_and_nested_block_on();
 
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0
     ).count();
 
     std::cout << "======================================================================\n";
-    std::cout << "  ALL 21 TEST SUITES PASSED SUCCESSFULLY in " << elapsed_ms << " ms!\n";
+    std::cout << "  ALL 25 TEST SUITES PASSED SUCCESSFULLY in " << elapsed_ms << " ms!\n";
     std::cout << "======================================================================\n";
     return 0;
 }
