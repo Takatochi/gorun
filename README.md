@@ -268,6 +268,11 @@ flowchart LR
 | :--- | :--- |
 | ```go wg.Add(1) go func() {     defer wg.Done()     defer close(ch)     ch <- 42 }() ``` | ```cpp wg.add(1); gorun::go([&]() {     GORUN_DEFER { wg.done(); };     GORUN_DEFER { ch.close(); };     ch.send(42); }); // Runs in LIFO order even if an exception is thrown! ``` |
 
+### Comparison E: Request `context.Context` (Go vs. `gorun::Context`)
+| Go (`context` package) | C++20 `gorun` (`gorun::Context`) |
+| :--- | :--- |
+| ```go ctx := context.WithValue(context.Background(), "trace", "req-42") ctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond) defer cancel()  select { case res := <-dbCh:     fmt.Println(res) case <-ctx.Done():     fmt.Println("Err:", ctx.Err(), ctx.Value("trace")) } ``` | ```cpp auto ctx = gorun::with_value(gorun::background(), "trace", std::string("req-42")); auto [tctx, cancel] = gorun::with_timeout(ctx, 50ms); GORUN_DEFER { cancel(); };  gorun::select(     db_ch.on_recv([](auto res) { std::cout << res << "\n"; }),     tctx.on_done([&]() {         std::cout << "Err: " << gorun::to_string(*tctx.err())                   << " [" << *tctx.value<std::string>("trace") << "]\n";     }) ); ``` |
+
 ---
 
 ## Where Concepts Are Borrowed From: Go vs. `gorun` (C++20/23)
@@ -287,6 +292,7 @@ flowchart LR
 | **Green Read-Write Mutex** | `sync.RWMutex` | `gorun::RwMutex` | Writer-preferring shared mutex compatible with `std::shared_lock` and `std::unique_lock`. |
 | **WaitGroup / Once / Cond** | `sync.WaitGroup`, `Once`, `Cond` | `WaitGroup`, `Once`, `CondVar` | Hybrid `UniversalWaiter` allows calling `.wait()` from both green routines and external OS threads (e.g. `int main()`). |
 | **Deferred Scope Cleanup** | `defer fn()` (`runtime._defer`) | `gorun::defer(fn)` / `GORUN_DEFER` | Block-scoped RAII `DeferGuard` on the routine stack (0 heap allocations, LIFO execution order, `.dismiss()` cancellation, runs even on C++ exception unwinding). |
+| **Cascading Request Context** | `context.Context` (`context`) | `gorun::Context` (`with_cancel`, `with_timeout`, `with_deadline`, `with_value`) | Parent-to-child cancellation tree with broadcast `done()` channel (`ctx.on_done(...)` in `select`), deadline clamping, `std::stop_token`, and type-safe `ctx.value<T>(key)`. |
 
 ---
 
@@ -651,12 +657,13 @@ The test binary (`gorun_tests.exe` / [tests/test_main.cpp](file:///c:/Users/naze
 | **18** | `test_18_lost_wakeup_and_work_stealing_stress` | **Extreme Park/Unpark & Work-Stealing Stress Test**: 3-stage MPMC pipeline (`capacity = 2` + unbuffered `capacity = 0`) driving thousands of `park_locked`/`unpark` cycles across 16 workers with zero lost wakeups | **PASSED** |
 | **19** | `test_19_defer_lifo_and_exception_cleanup` | **`gorun::defer` & `GORUN_DEFER`**: LIFO execution order of multiple defers, `.dismiss()` cancellation, and guaranteed `wg.done()` + `ch.close()` cleanup when a routine throws an exception | **PASSED** |
 | **20** | `test_20_zero_lost_pointers_and_lifetime_audit` | **Zero Lost Pointers & Exact Lifetime Audit**: tracks 10,500 heap-allocated `TrackedObject` instances across routine closures, channels, and `run_next_` steals (`Constructed: 10500 == Destroyed: 10500, Live Leaks: 0`) | **PASSED** |
+| **21** | `test_21_go_style_context_tree_and_timeout` | **Go-Style `gorun::Context`**: cascading `parent -> child -> grandchild` cancellation tree, `with_timeout` (`ContextError::DeadlineExceeded`), `with_value` key-value inheritance, and `select(ctx.on_done(...))` | **PASSED** |
 
 ### Actual Test Suite Console Output (`gorun_tests.exe`)
 
 ```text
 ======================================================================
-  gorun C++20 M:N Green Threads Runtime — 20 Comprehensive Test Suites
+  gorun C++20 M:N Green Threads Runtime — 21 Comprehensive Test Suites
   Active OS Worker Threads: 16
 ======================================================================
 [TEST 01] Ergonomic go(...) + Buffered Channel in main()... PASSED
@@ -679,8 +686,9 @@ The test binary (`gorun_tests.exe` / [tests/test_main.cpp](file:///c:/Users/naze
 [TEST 18] Extreme Park/Unpark & Work-Stealing Stress Test (1,000 routines)... PASSED
 [TEST 19] gorun::defer(...) & GORUN_DEFER (LIFO order, dismiss, exception safety)... PASSED
 [TEST 20] Zero Lost Pointers & Exact Constructor/Destructor Audit (10,000 objects)... PASSED (Constructed: 10500, Destroyed: 10500, Live Leaks: 0)
+[TEST 21] Go-Style gorun::Context (with_cancel, with_timeout, with_value, cascading tree)... PASSED
 ======================================================================
-  ALL 20 TEST SUITES PASSED SUCCESSFULLY in 258 ms!
+  ALL 21 TEST SUITES PASSED SUCCESSFULLY in 383 ms!
 ======================================================================
 ```
 
@@ -719,6 +727,7 @@ go run benchmarks/bench_go.go
 All public headers in `include/gorun/` are documented with **English Doxygen / Javadoc comments** (`@class`, `@brief`, `@param`, `@return`, `@throws`, `@code`), providing rich Quick Documentation tooltips in **CLion**, **IntelliJ IDEA**, and **VS Code**:
 
 - [include/gorun/gorun.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/gorun.hpp) — Single umbrella header.
+- [include/gorun/context_go.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/context_go.hpp) — Go-style cascading request `gorun::Context` (`background`, `todo`, `with_cancel`, `with_timeout`, `with_deadline`, `with_value`, and `ctx.on_done(...)`).
 - [include/gorun/defer.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/defer.hpp) — Zero-overhead RAII `gorun::defer(...)`, `DeferGuard<F>`, and statement macro `GORUN_DEFER { ... };`.
 - [include/gorun/runtime.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/runtime.hpp) — `Runtime`, `Config`, `Worker`, `Routine`, `UniversalWaiter`, `this_routine::yield()`, `this_routine::sleep_for()`, `RoutineLocal<T>`.
 - [include/gorun/channel.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/channel.hpp) — `Channel<T>` (buffered & unbuffered rendezvous) and `select(...)` multiplexer.

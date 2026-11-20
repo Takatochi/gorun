@@ -80,6 +80,34 @@ int main() {
         })
     );
 
+    // 4. Go-Style cascading Context (`with_timeout`, `with_value`, `GORUN_DEFER { cancel(); }`, and `ctx.on_done()`)
+    auto root_ctx = gorun::with_value(gorun::background(), "trace_id", std::string("http-req-7749"));
+    auto [req_ctx, cancel] = gorun::with_timeout(root_ctx, 25ms);
+    GORUN_DEFER { cancel(); };
+
+    gorun::Channel<std::string> slow_db_query(1);
+    gorun::go([&, req_ctx]() {
+        // Simulate a slow DB query that respects req_ctx.on_done()!
+        gorun::select(
+            gorun::on_timeout(100ms, [&]() {
+                slow_db_query.send("DB Row");
+            }),
+            req_ctx.on_done([&]() {
+                // Aborted early as soon as req_ctx timed out at 25ms!
+            })
+        );
+    });
+
+    gorun::select(
+        slow_db_query.on_recv([](std::string row) {
+            std::cout << "[Demo 4] DB returned: " << row << "\n";
+        }),
+        req_ctx.on_done([&]() {
+            std::cout << "[Demo 4] Request Context [" << *req_ctx.value<std::string>("trace_id")
+                      << "] aborted: " << gorun::to_string(*req_ctx.err()) << "\n";
+        })
+    );
+
     gorun::default_runtime().wait_idle();
     return 0;
 }

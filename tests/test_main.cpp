@@ -23,6 +23,7 @@
  * 18. Extreme M:N Work-Stealing & Lost-Wakeup Race Condition Stress Test (1,000 routines, 3-stage MPMC pipeline).
  * 19. `gorun::defer(...)` and `GORUN_DEFER { ... };` (LIFO execution order, `.dismiss()`, and exception-safe cleanup).
  * 20. Zero Lost Pointers & Exact Constructor/Destructor Lifetime Audit (10,500 heap objects across closures & channels).
+ * 21. Go-Style `gorun::Context` (`background`, `with_cancel`, `with_timeout`, `with_deadline`, `with_value`, cascading tree cancellation, and `select(ctx.on_done(...))`).
  */
 
 #include <atomic>
@@ -793,12 +794,88 @@ void test_20_zero_lost_pointers_and_lifetime_audit() {
               << ", Live Leaks: " << TrackedObject::live_instances.load() << ")\n";
 }
 
+// 21. Go-Style gorun::Context: cascading cancellation tree, with_timeout, with_value, and select(ctx.on_done(...))
+void test_21_go_style_context_tree_and_timeout() {
+    std::cout << "[TEST 21] Go-Style gorun::Context (with_cancel, with_timeout, with_value, cascading tree)... ";
+
+    // 21.1. Hierarchical key-value propagation (`with_value`) + cascading parent -> child -> grandchild cancellation
+    auto root = gorun::background();
+    GORUN_TEST_ASSERT(!root.is_canceled());
+    GORUN_TEST_ASSERT(!root.err().has_value());
+
+    auto req_ctx = gorun::with_value(root, "trace_id", std::string("req-abc-123"));
+    req_ctx = gorun::with_value(req_ctx, "user_id", 42);
+
+    auto [parent_ctx, parent_cancel] = gorun::with_cancel(req_ctx);
+    auto [child_ctx, child_cancel] = gorun::with_cancel(parent_ctx);
+    auto grandchild_ctx = gorun::with_value(child_ctx, "db_shard", std::string("shard-07"));
+
+    // Verify inherited values across the tree
+    GORUN_TEST_ASSERT(grandchild_ctx.value<std::string>("trace_id") == "req-abc-123");
+    GORUN_TEST_ASSERT(grandchild_ctx.value<int>("user_id") == 42);
+    GORUN_TEST_ASSERT(grandchild_ctx.value<std::string>("db_shard") == "shard-07");
+    GORUN_TEST_ASSERT(!grandchild_ctx.value<int>("non_existent").has_value());
+
+    // Spawn 8 routines waiting on child_ctx.on_done() and grandchild_ctx.on_done() via gorun::select(...)
+    std::atomic<int> woken_by_ctx_done{0};
+    gorun::Channel<int> never_ready_ch(0);
+
+    {
+        gorun::Scope scope;
+        for (int i = 0; i < 8; ++i) {
+            gorun::Context target_ctx = (i % 2 == 0) ? child_ctx : grandchild_ctx;
+            gorun::go([&, target_ctx]() {
+                gorun::select(
+                    never_ready_ch.on_recv([](int) { GORUN_TEST_ASSERT(false); }),
+                    target_ctx.on_done([&]() {
+                        woken_by_ctx_done.fetch_add(1, std::memory_order_relaxed);
+                    })
+                );
+            });
+        }
+
+        gorun::sleep_for(5ms);
+        // Cancel ONLY the parent_ctx -> must cascade to child_ctx and grandchild_ctx and wake all 8 routines!
+        parent_cancel();
+    }
+
+    GORUN_TEST_ASSERT(woken_by_ctx_done.load() == 8);
+    GORUN_TEST_ASSERT(parent_ctx.err() == gorun::ContextError::Canceled);
+    GORUN_TEST_ASSERT(child_ctx.err() == gorun::ContextError::Canceled);
+    GORUN_TEST_ASSERT(grandchild_ctx.err() == gorun::ContextError::Canceled);
+    GORUN_TEST_ASSERT(gorun::to_string(*grandchild_ctx.err()) == "context canceled");
+    child_cancel(); // Idempotent safe call
+
+    // 21.2. Automatic timeout (`with_timeout`) + GORUN_DEFER { cancel(); } pattern
+    {
+        auto [timeout_ctx, cancel] = gorun::with_timeout(gorun::background(), 15ms);
+        GORUN_DEFER { cancel(); };
+
+        GORUN_TEST_ASSERT(timeout_ctx.deadline().has_value());
+        bool done_triggered = false;
+
+        gorun::select(
+            never_ready_ch.on_recv([](int) { GORUN_TEST_ASSERT(false); }),
+            timeout_ctx.on_done([&]() {
+                done_triggered = true;
+            })
+        );
+
+        GORUN_TEST_ASSERT(done_triggered);
+        GORUN_TEST_ASSERT(timeout_ctx.is_canceled());
+        GORUN_TEST_ASSERT(timeout_ctx.err() == gorun::ContextError::DeadlineExceeded);
+        GORUN_TEST_ASSERT(gorun::to_string(*timeout_ctx.err()) == "context deadline exceeded");
+    }
+
+    std::cout << "PASSED\n";
+}
+
 int main() {
     std::cout << std::unitbuf;
     auto t0 = std::chrono::steady_clock::now();
 
     std::cout << "======================================================================\n";
-    std::cout << "  gorun C++20 M:N Green Threads Runtime — 20 Comprehensive Test Suites\n";
+    std::cout << "  gorun C++20 M:N Green Threads Runtime — 21 Comprehensive Test Suites\n";
     std::cout << "  Active OS Worker Threads: " << gorun::default_runtime().worker_count() << "\n";
     std::cout << "======================================================================\n";
 
@@ -822,13 +899,14 @@ int main() {
     test_18_lost_wakeup_and_work_stealing_stress();
     test_19_defer_lifo_and_exception_cleanup();
     test_20_zero_lost_pointers_and_lifetime_audit();
+    test_21_go_style_context_tree_and_timeout();
 
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0
     ).count();
 
     std::cout << "======================================================================\n";
-    std::cout << "  ALL 20 TEST SUITES PASSED SUCCESSFULLY in " << elapsed_ms << " ms!\n";
+    std::cout << "  ALL 21 TEST SUITES PASSED SUCCESSFULLY in " << elapsed_ms << " ms!\n";
     std::cout << "======================================================================\n";
     return 0;
 }
