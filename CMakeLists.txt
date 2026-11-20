@@ -58,6 +58,9 @@ if(GORUN_BUILD_EXAMPLES)
 
     add_executable(example_04_worker_pool examples/04_worker_pool_and_sync.cpp)
     target_link_libraries(example_04_worker_pool PRIVATE gorun::gorun)
+
+    add_executable(example_05_memory_arenas examples/05_memory_arenas_and_pointers.cpp)
+    target_link_libraries(example_05_memory_arenas PRIVATE gorun::gorun)
 endif()
 
 if(GORUN_BUILD_BENCHMARKS)

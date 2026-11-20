@@ -4,6 +4,7 @@
 [![C++20 / C++23](https://img.shields.io/badge/C%2B%2B-20%20%7C%2023-00599C?logo=c%2B%2B)](https://en.cppreference.com/w/cpp/20)
 [![Header-Only](https://img.shields.io/badge/Library-Header--Only%20(Zero%20Deps)-success)](#quick-start--installation-how-to-use-gorun-in-your-project)
 [![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions%20(Linux%20%7C%20Windows)-2088FF?logo=github-actions)](./.github/workflows/ci.yml)
+[![Docs Website](https://img.shields.io/badge/Docs-GitHub%20Pages%20Website-38bdf8)](https://takatochi.github.io/gorun/)
 
 `gorun` is a header-only, zero-dependency C++20/23 concurrency runtime bringing **Go's M:N work-stealing scheduler (`G-M-P`)**, **isolated stackful routines**, **zero-copy typed channels (`Channel<T>`)**, **`select(...)` multiplexing**, **`GORUN_DEFER`**, and **C++-safe structured concurrency (`Scope` / `TaskGroup`)** to modern C++.
 
@@ -936,6 +937,8 @@ All public headers in `include/gorun/` are documented with **English Doxygen / J
   - [examples/02_structured_concurrency_and_defer.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/examples/02_structured_concurrency_and_defer.cpp) — `gorun::Scope`, `gorun::TaskGroup`, `std::stop_token`, and transaction rollbacks with `defer.dismiss()`.
   - [examples/03_web_microservice_context.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/examples/03_web_microservice_context.cpp) — HTTP microservice route handler using `gorun::Context` (`with_timeout`, `with_value`, `ctx.on_done`) and `gorun::Semaphore`.
   - [examples/04_worker_pool_and_sync.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/examples/04_worker_pool_and_sync.cpp) — Read-through cache with `gorun::RwMutex`, `gorun::Once`, and `gorun::go_async` (`JoinHandle<T>`).
+  - [examples/05_memory_arenas_and_pointers.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/examples/05_memory_arenas_and_pointers.cpp) — Custom Linear Bump Arena allocator (`LinearArena` + `GORUN_DEFER`), zero-copy `std::unique_ptr<PacketSlab>` 3-stage pipeline, and cross-routine raw stack pointers (`StackWorkNode*`).
+- [docs/index.html](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/docs/index.html) & [.github/workflows/pages.yml](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/.github/workflows/pages.yml) — Standalone documentation website automatically deployed to GitHub Pages (`https://takatochi.github.io/gorun/`).
 - [benchmarks/bench_gorun.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/benchmarks/bench_gorun.cpp), [benchmarks/bench_go.go](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/benchmarks/bench_go.go) & [benchmarks/bench_std_alternatives.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/benchmarks/bench_std_alternatives.cpp) — 3-way performance benchmark suite (`gorun` vs. Go vs. Standard C++).
 - [.github/workflows/ci.yml](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/.github/workflows/ci.yml) — Automated GitHub Actions CI/CD pipeline (GCC, Clang, ASan/UBSan, Windows MinGW-w64, CMake install & release packaging).
 - [LICENSE](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/LICENSE) — Apache License, Version 2.0.
