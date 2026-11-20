@@ -114,6 +114,7 @@ __asm__(
     "  retq\n"
     ".globl gorun_routine_entry_asm\n"
     "gorun_routine_entry_asm:\n"
+    "  subq $8, %rsp\n" // Align RSP so that inside `callq *%r13`, RSP % 16 == 8 (System V AMD64 ABI requirement for SSE/movaps!)
     "  movq %r12, %rdi\n"
     "  callq *%r13\n"
     "  ud2\n"

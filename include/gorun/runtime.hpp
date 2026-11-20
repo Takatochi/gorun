@@ -24,6 +24,21 @@
 #include <utility>
 #include <vector>
 
+#if defined(__SANITIZE_ADDRESS__)
+#define GORUN_HAS_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define GORUN_HAS_ASAN 1
+#endif
+#endif
+
+#if defined(GORUN_HAS_ASAN)
+extern "C" {
+void __sanitizer_start_switch_fiber(void** fake_stack_save, const void* bottom, std::size_t size);
+void __sanitizer_finish_switch_fiber(void* fake_stack_save, const void** bottom_old, std::size_t* size_old);
+}
+#endif
+
 #include "gorun/detail/context.hpp"
 #include "gorun/detail/spinlock.hpp"
 #include "gorun/detail/stack_pool.hpp"
@@ -89,6 +104,9 @@ struct Routine {
 
     Routine* prev{nullptr};
     Routine* next{nullptr};
+#if defined(GORUN_HAS_ASAN)
+    void* asan_fake_stack{nullptr};
+#endif
 };
 
 inline Worker*& tls_current_worker() noexcept {
@@ -364,6 +382,11 @@ class Worker {
     bool finish_requested_{false};
     std::uint64_t tick_{0};
     std::mt19937 rng_;
+#if defined(GORUN_HAS_ASAN)
+    void* asan_scheduler_fake_stack_{nullptr};
+    const void* asan_scheduler_bottom_{nullptr};
+    std::size_t asan_scheduler_size_{0};
+#endif
 
 public:
     Worker(Runtime& rt, std::size_t idx)
@@ -375,6 +398,30 @@ public:
     [[nodiscard]] std::size_t index() const noexcept { return index_; }
     [[nodiscard]] ExecutionContext& scheduler_context() noexcept { return scheduler_ctx_; }
     [[nodiscard]] std::vector<std::unique_ptr<Routine>>& local_free_routines() noexcept { return local_free_routines_; }
+
+#if defined(GORUN_HAS_ASAN)
+    void asan_before_switch_to_routine(Routine* r) noexcept {
+        __sanitizer_start_switch_fiber(&asan_scheduler_fake_stack_, r->stack.stack_bottom, r->stack.usable_bytes);
+    }
+
+    void asan_after_switch_to_routine(Routine* r) noexcept {
+        __sanitizer_finish_switch_fiber(r->asan_fake_stack, &asan_scheduler_bottom_, &asan_scheduler_size_);
+    }
+
+    void asan_before_switch_to_scheduler(Routine* r, bool is_finishing) noexcept {
+        __sanitizer_start_switch_fiber(
+            is_finishing ? nullptr : &r->asan_fake_stack,
+            asan_scheduler_bottom_,
+            asan_scheduler_size_
+        );
+    }
+
+    void asan_after_switch_to_scheduler() noexcept {
+        const void* dummy_bottom = nullptr;
+        std::size_t dummy_size = 0;
+        __sanitizer_finish_switch_fiber(asan_scheduler_fake_stack_, &dummy_bottom, &dummy_size);
+    }
+#endif
 
     /**
      * @brief Atomically transitions the current routine to `Parked`, switches CPU context to `scheduler_ctx_`,
@@ -389,7 +436,13 @@ public:
         Routine* r = current_routine_;
         r->state = RoutineState::Parked;
         pending_unlock_ = &primitive_lock;
+#if defined(GORUN_HAS_ASAN)
+        asan_before_switch_to_scheduler(r, false);
+#endif
         context_switch(&r->ctx, &scheduler_ctx_);
+#if defined(GORUN_HAS_ASAN)
+        current_worker()->asan_after_switch_to_routine(r);
+#endif
     }
 
     /**
@@ -399,7 +452,13 @@ public:
         Routine* r = current_routine_;
         r->state = RoutineState::Ready;
         yield_requested_ = true;
+#if defined(GORUN_HAS_ASAN)
+        asan_before_switch_to_scheduler(r, false);
+#endif
         context_switch(&r->ctx, &scheduler_ctx_);
+#if defined(GORUN_HAS_ASAN)
+        current_worker()->asan_after_switch_to_routine(r);
+#endif
     }
 
     /**
@@ -409,7 +468,14 @@ public:
         Routine* r = current_routine_;
         r->state = RoutineState::Finished;
         finish_requested_ = true;
+#if defined(GORUN_HAS_ASAN)
+        // Note: routines in our pool loop forever in routine_trampoline, so their stack stays alive for reuse!
+        asan_before_switch_to_scheduler(r, false);
+#endif
         context_switch(&r->ctx, &scheduler_ctx_);
+#if defined(GORUN_HAS_ASAN)
+        current_worker()->asan_after_switch_to_routine(r);
+#endif
     }
 
     /**
@@ -495,7 +561,13 @@ public:
             tls_current_routine() = r;
             r->state = RoutineState::Running;
 
+#if defined(GORUN_HAS_ASAN)
+            asan_before_switch_to_routine(r);
+#endif
             context_switch(&scheduler_ctx_, &r->ctx);
+#if defined(GORUN_HAS_ASAN)
+            asan_after_switch_to_scheduler();
+#endif
 
             current_routine_ = nullptr;
             tls_current_routine() = nullptr;
@@ -549,6 +621,9 @@ inline void UniversalWaiter::unpark() noexcept {
 
 inline void Runtime::routine_trampoline(void* arg) noexcept {
     auto* r = static_cast<detail::Routine*>(arg);
+#if defined(GORUN_HAS_ASAN)
+    detail::current_worker()->asan_after_switch_to_routine(r);
+#endif
     for (;;) {
         detail::Worker* w_entry = detail::current_worker();
         if (w_entry->pending_unlock_) {
