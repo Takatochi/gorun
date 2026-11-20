@@ -61,7 +61,7 @@ jobs:
         run: cmake --build build --config ${{ matrix.build_type }} --parallel
         shell: bash
 
-      - name: Run 19 Comprehensive Unit & Race-Condition Test Suites
+      - name: Run 25 Comprehensive Unit & Race-Condition Test Suites
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
         shell: bash
 
@@ -86,7 +86,8 @@ jobs:
       - name: Package Header-Only Release Archive
         run: |
           mkdir -p dist/gorun
-          cp -r include cmake CMakeLists.txt LICENSE README.md dist/gorun/
+          cp -r include single_include cmake CMakeLists.txt LICENSE README.md CHANGELOG.md dist/gorun/
+          cp single_include/gorun/gorun.hpp dist/gorun-${GITHUB_REF_NAME}-single-header.hpp
           cd dist
           tar -czvf gorun-${GITHUB_REF_NAME}-header-only.tar.gz gorun
           zip -r gorun-${GITHUB_REF_NAME}-header-only.zip gorun
@@ -94,7 +95,10 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          name: gorun ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
           files: |
+            dist/gorun-${{ github.ref_name }}-single-header.hpp
             dist/gorun-${{ github.ref_name }}-header-only.tar.gz
             dist/gorun-${{ github.ref_name }}-header-only.zip
-          generate_release_notes: true
+          generate_release_notes: false
