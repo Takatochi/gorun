@@ -1,0 +1,33 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+dist/
+install_prefix/
+
+# Compiled binaries and objects
+*.exe
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.pdb
+*.ilk
+
+# IDE and Editor settings
+.idea/
+.vscode/
+.vs/
+*.suo
+*.user
+*.sln
+*.vcxproj*
+compile_commands.json
+.cache/
+
+# OS generated files
+.DS_Store
+Thumbs.db
