@@ -576,6 +576,130 @@ void handle_http_request() {
 
 ---
 
+## Complete Tool-by-Tool Reference & "The One-Way Rules" (How It Works, DOs & DON'Ts)
+
+To write rock-solid, zero-bug concurrent C++ with `gorun`, follow these strict architectural rules for each tool:
+
+---
+
+### 1. `gorun::go(...)`, `gorun::Scope`, and `gorun::TaskGroup`
+* **What it is:** `go(fn)` spawns a lightweight stackful green routine (128 KB pooled stack + 4 KB Guard Page). `Scope` and `TaskGroup` are RAII structured concurrency boundaries that automatically bind all inner `go(...)` calls and guarantee their completion before scope exit.
+* **How it works under the hood:**
+  * When `gorun::Scope scope;` is declared on the stack, it registers itself in the current routine's `implicit_scope` pointer.
+  * Every `gorun::go(...)` called inside that block (even inside deeply nested helper functions or child routines!) increments the `Scope`'s internal `WaitGroup` and inherits its `std::stop_token`.
+  * When `scope` is destroyed at `}`, `~Scope()` parks the parent routine until the counter drops to `0`.
+* **DO (The One Way):**
+  * **Always declare `gorun::Scope scope;` before using `[&]` reference captures** in `gorun::go([&]{ ... })`.
+  * Pass values (`[x, ptr]`) or `gorun::Context` by value when launching background/detached `gorun::go(...)` routines outside a `Scope`.
+  * Use `gorun::TaskGroup` when you need explicit exception propagation (`group.wait()` rethrows the first child exception and automatically triggers `std::stop_token` cancellation on all siblings).
+* **DON'T (Forbidden):**
+  * **NEVER capture local stack variables by reference `[&]` in a detached `gorun::go(...)` without an enclosing `gorun::Scope`, `WaitGroup::wait()`, or `Channel::recv()` barrier** before the function returns! Unlike Go, C++ does not move stack frames to a garbage-collected heap.
+
+```cpp
+// [WRONG]: Detached routine captures local `x` by reference [&] and outlives `bad_func()`!
+void bad_func() {
+    int x = 42;
+    gorun::go([&]() { std::cout << x; }); // <-- DANGLING REFERENCE after bad_func() returns!
+}
+
+// [CORRECT - Option A (Structured Scope)]: ~Scope() guarantees completion before `x` is destroyed!
+void good_scoped_func() {
+    int x = 42;
+    gorun::Scope scope;
+    gorun::go([&]() { std::cout << x; }); // <-- 100% SAFE!
+}
+
+// [CORRECT - Option B (Detached by Value)]: Copy value or shared_ptr for fire-and-forget tasks!
+void good_detached_func() {
+    int x = 42;
+    gorun::go([x]() { std::cout << x; }); // <-- 100% SAFE!
+}
+```
+
+---
+
+### 2. `gorun::Channel<T>` & `gorun::select(...)`
+* **What it is:** Typed MPMC message-passing conduit supporting both **Unbuffered Rendezvous (`capacity == 0`)** and **Buffered Ring-Buffer (`capacity > 0`)** modes, plus Go-style multi-channel multiplexing via `gorun::select(...)`.
+* **How it works under the hood:**
+  * When a routine parks on `send()` or `recv()`, it allocates a `ChannelWaiter<T>` node and data slot **directly on its own frozen stack frame** (0 heap allocations).
+  * In rendezvous mode (`capacity == 0`), the waking peer moves `T` (`std::move`) directly from the sender's stack into the receiver's stack (`183 ns/op`).
+* **DO (The One Way):**
+  * **Always close producer channels via `GORUN_DEFER { ch.close(); };`** inside the producer routine so receivers in `while (auto v = ch.recv())` never hang forever.
+  * Check the return value of `ch.send(val)` (`false` means the channel was closed) and `ch.recv()` (`std::nullopt` means the channel is closed and drained).
+  * Use `gorun::select(...)` with `ctx.on_done(...)` or `gorun::on_timeout(...)` whenever waiting on external/untrusted producers.
+* **DON'T (Forbidden):**
+  * **NEVER destroy a `Channel<T>` while another detached routine still holds a raw reference `&ch` to it.** Ensure the channel outlives all routines using it (e.g. declare `Channel<T>` *above* `gorun::Scope scope;`, or wrap it in `std::shared_ptr<Channel<T>>` for detached pipelines).
+
+---
+
+### 3. `gorun::Mutex`, `gorun::RwMutex`, `gorun::CondVar`, `gorun::WaitGroup`, `gorun::Semaphore`, `gorun::Once`
+* **What it is:** Green-thread synchronization primitives that park only the contending green routine in ~65 ns while keeping the OS worker thread 100% active.
+* **How it works under the hood:**
+  * Satisfies standard C++ `Lockable` / `SharedLockable` concepts (`std::lock_guard`, `std::unique_lock`, `std::shared_lock`).
+  * Uses `Worker::park_locked(SpinLock&)` post-switch unlock hook so no routine can ever suffer a Lost Wakeup.
+* **DO (The One Way):**
+  * **Always use `gorun::Mutex` + `std::lock_guard` / `std::unique_lock` inside green routines.**
+  * Use `gorun::Semaphore` to bound concurrent access to external pools (database connections, file descriptors, HTTP client pools).
+  * Always call `wg.add(N)` **before** spawning the green routines that will call `wg.done()`.
+* **DON'T (Forbidden):**
+  * **NEVER use `std::mutex`, `std::shared_mutex`, `std::condition_variable`, or `std::this_thread::sleep_for` inside a green routine!** Blocking on `std::mutex` puts the entire OS kernel thread (`Worker`) to sleep, freezing up to dozens of other runnable green routines queued on that worker!
+
+```cpp
+// [WRONG]: Blocks the entire OS Worker thread in the kernel!
+std::mutex os_mtx;
+gorun::go([&]() {
+    std::lock_guard lk(os_mtx);        // <-- FREEZES OS WORKER THREAD!
+    std::this_thread::sleep_for(10ms); // <-- FREEZES OS WORKER THREAD!
+});
+
+// [CORRECT]: Parks only the green routine; OS Worker immediately runs other routines!
+gorun::Mutex green_mtx;
+gorun::go([&]() {
+    std::lock_guard lk(green_mtx); // <-- Zero OS-thread blocking!
+    gorun::sleep_for(10ms);        // <-- Parks on min-heap timer!
+});
+```
+
+---
+
+### 4. `gorun::Context` (`background`, `with_cancel`, `with_timeout`, `with_deadline`, `with_value`)
+* **What it is:** Hierarchical, thread-safe request lifecycle & metadata bag modeled on Go's `context.Context`.
+* **How it works under the hood:**
+  * Forms an immutable parent-to-child tree of `std::shared_ptr<ContextNode>`.
+  * When a parent is canceled or its timer deadline expires on the runtime's `Timer Thread`, it atomically sets `ContextError::Canceled` / `DeadlineExceeded`, closes its broadcast `done_channel_`, signals `std::stop_token`, and recursively cancels all child nodes.
+* **DO (The One Way):**
+  * **Pass `gorun::Context` as the first parameter by value (`gorun::Context ctx` or `const gorun::Context&`)** to every HTTP handler, RPC call, and DB query.
+  * **Always pair `with_cancel` / `with_timeout` / `with_deadline` with `GORUN_DEFER { cancel(); };`** immediately on the next line to release tree references as soon as the operation finishes.
+  * Use `ctx.on_done([&]{ ... })` inside `gorun::select(...)` to abort slow operations immediately when the caller disconnects or times out.
+* **DON'T (Forbidden):**
+  * **NEVER store mutable raw pointers inside `with_value`** without synchronization—store immutable values (`int`, `std::string`, `std::shared_ptr<const Config>`) so hundreds of child routines can read `ctx.value<T>(key)` lock-free.
+
+---
+
+### 5. `GORUN_DEFER { ... };` and `gorun::defer(fn)`
+* **What it is:** Zero-allocation stack RAII scope guard that executes cleanup actions in **LIFO (Last-In, First-Out)** order upon leaving the current `{ ... }` block.
+* **How it works under the hood:**
+  * Unlike Go's `defer` (which runs at *function* return and allocates `_defer` nodes), `GORUN_DEFER` runs at **lexical block `{ ... }` exit** and is 100% stack-inlined.
+  * `auto guard = gorun::defer(fn);` allows calling `guard.dismiss()` to cancel a rollback action after a successful transaction commit.
+* **DO (The One Way):**
+  * Put `GORUN_DEFER { wg.done(); };`, `GORUN_DEFER { ch.close(); };`, or `GORUN_DEFER { sem.release(); };` immediately after acquiring the resource.
+  * Remember that in a `for` loop, a `GORUN_DEFER` declared inside the loop body `{ ... }` executes at the end of **each iteration** (which is ideal for releasing per-iteration locks or semaphores!).
+* **DON'T (Forbidden):**
+  * **NEVER throw uncaught exceptions from inside a `GORUN_DEFER` block** (since it executes inside a C++ destructor `~DeferGuard() noexcept`, any exception thrown inside is swallowed to prevent `std::terminate` during stack unwinding).
+
+---
+
+### 6. `gorun::RoutineLocal<T>` vs. `thread_local`
+* **What it is:** Per-routine isolated storage indexed by `gorun::this_routine::id()`.
+* **How it works under the hood:**
+  * Because M:N work-stealing migrates green routines across different OS worker threads whenever a routine parks (`Channel::recv`, `Mutex::lock`, `sleep_for`, `yield`), a green routine may start on **OS Thread #0** and resume after `park()` on **OS Thread #7**.
+* **DO (The One Way):**
+  * Use `gorun::RoutineLocal<T>` (or `gorun::Context` with `with_value`) for any state that belongs to the current green routine across suspension points.
+* **DON'T (Forbidden):**
+  * **NEVER cache the address or value of a C++ `thread_local` variable across a `gorun` suspension point (`yield`, `sleep_for`, `Channel`, `Mutex`)**, because after waking up the routine may be running on a different OS worker thread!
+
+---
+
 ## Ecosystem Comparison: `gorun` vs. Popular C++ Concurrency Libraries
 
 When building high-concurrency network services or web frameworks in C++, developers traditionally face a painful trade-off between **OS threads** (`std::jthread`), **C++20 stackless coroutines** (`co_await` / Boost.Asio), **Boost.Fiber**, or **DAG task graphs** (Cpp-Taskflow).
