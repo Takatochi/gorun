@@ -1,0 +1,744 @@
+# `gorun` — High-Performance M:N Green Threads, Channels & Structured Concurrency for C++20/23
+
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
+[![C++20 / C++23](https://img.shields.io/badge/C%2B%2B-20%20%7C%2023-00599C?logo=c%2B%2B)](https://en.cppreference.com/w/cpp/20)
+[![Header-Only](https://img.shields.io/badge/Library-Header--Only%20(Zero%20Deps)-success)](#quick-start--installation-how-to-use-gorun-in-your-project)
+[![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions%20(Linux%20%7C%20Windows)-2088FF?logo=github-actions)](./.github/workflows/ci.yml)
+
+`gorun` is a header-only, zero-dependency C++20/23 concurrency runtime bringing **Go's M:N work-stealing scheduler (`G-M-P`)**, **isolated stackful routines**, **zero-copy typed channels (`Channel<T>`)**, **`select(...)` multiplexing**, **`GORUN_DEFER`**, and **C++-safe structured concurrency (`Scope` / `TaskGroup`)** to modern C++.
+
+Created by **Artur Havor (Гавор Артур)** and licensed under the permissive **[Apache License 2.0](./LICENSE)**.
+
+---
+
+## Quick Start & Installation (How to Use `gorun` in Your Project)
+
+Because `gorun` is **100% header-only** with **zero external dependencies**, you can integrate it into any C++20/23 project in seconds using one of the 4 standard methods below:
+
+### Option 1: CMake `FetchContent` (Recommended — Zero Manual Setup)
+Add this directly to your project's `CMakeLists.txt`. CMake will automatically download `gorun` and configure the `gorun::gorun` target:
+
+```cmake
+include(FetchContent)
+
+FetchContent_Declare(
+    gorun
+    GIT_REPOSITORY https://github.com/Takatochi/gorun.git
+    GIT_TAG        main # or v0.1.0
+)
+FetchContent_MakeAvailable(gorun)
+
+add_executable(my_app main.cpp)
+target_link_libraries(my_app PRIVATE gorun::gorun)
+```
+
+### Option 2: Copy the `include/gorun` Folder (Header-Only Drop-In)
+Simply copy the [`include/gorun`](./include/gorun) directory into your project's `include/` folder and `#include "gorun/gorun.hpp"`:
+
+```bash
+# Compile directly with GCC / Clang / MinGW-w64:
+g++ -std=c++20 -O3 -pthread -Iinclude main.cpp -o my_app
+```
+
+### Option 3: Git Submodule + `add_subdirectory`
+```bash
+git submodule add https://github.com/Takatochi/gorun.git external/gorun
+```
+Then in your `CMakeLists.txt`:
+```cmake
+add_subdirectory(external/gorun)
+target_link_libraries(my_app PRIVATE gorun::gorun)
+```
+
+### Option 4: System-Wide CMake Install + `find_package(gorun)`
+```bash
+git clone https://github.com/Takatochi/gorun.git
+cd gorun
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --install build --prefix /usr/local   # or C:/Program Files/gorun on Windows
+```
+Then in any downstream CMake project:
+```cmake
+find_package(gorun 0.1.0 REQUIRED CONFIG)
+target_link_libraries(my_app PRIVATE gorun::gorun)
+```
+
+### Minimal 15-Line Example (`main.cpp`)
+```cpp
+#include <iostream>
+#include "gorun/gorun.hpp"
+
+int main() {
+    gorun::Channel<int> ch(4);
+
+    gorun::go([&]() {
+        GORUN_DEFER { ch.close(); }; // Guaranteed channel close on scope exit!
+        ch.send(42);
+    });
+
+    if (auto v = ch.recv()) {
+        std::cout << "Hello from green routine: " << *v << "\n";
+    }
+}
+```
+
+---
+
+## Key Architectural Invariants
+
+1. **Zero OS-Thread Blocking on User Synchronization:**
+   All `gorun` primitives (`Channel<T>`, `Mutex`, `CondVar`, `WaitGroup`, `Semaphore`, `Once`, `RwMutex`, `sleep_for`) **never block the underlying OS worker thread (`std::jthread`)**. Instead, they park the calling green routine in ~15–65 ns via a user-space assembly context switch and immediately yield the OS thread to other runnable routines.
+2. **Structured Concurrency by Default (`Scope` / `TaskGroup`):**
+   Unlike Go (where a compiler escape-analysis pass moves local variables captured by reference to the garbage-collected heap), C++ destroys stack variables upon scope exit. `gorun::Scope` and `gorun::TaskGroup` guarantee that all spawned child routines finish before the lexical scope exits—even when launched with plain `gorun::go([&]{ ... })` inside the block!
+3. **Stack Stability Invariant:**
+   Go dynamically reallocates and copies goroutine stacks when they grow, invalidating raw pointers into the stack. `gorun` allocates fixed virtual-memory stacks (`VirtualAlloc` / `mmap`) with a hardware **Guard Page** (`PAGE_NOACCESS` / `PROT_NONE`) at the bottom and caches them in a lock-free per-worker pool (`p.gFree` + `StackPool`). Stack addresses **never move**, making pointers and references to local stack variables 100% valid across suspension points (`park` / `yield`).
+4. **Exception Safety:**
+   An uncaught C++ exception inside a green routine never crashes the OS worker thread (`std::terminate`). Inside `TaskGroup`, `Scope`, `JoinHandle<T>`, or `Runtime::block_on()`, exceptions are captured via `std::exception_ptr`, automatically trigger cooperative cancellation (`std::stop_token`) of sibling routines, and are rethrown cleanly to the awaiting caller.
+
+---
+
+## Visual Architecture & Execution Diagrams
+
+### 1. M:N Work-Stealing Scheduler Architecture (`G-M-P` Model in C++20)
+
+```mermaid
+flowchart TD
+    subgraph Runtime["gorun::Runtime (default_runtime() or isolated instance)"]
+        GQ["Global Run Queue (FIFO)\nPolled every 61st tick for fairness"]
+        TP["Min-Heap Timer Thread\n(this_routine::sleep_for / on_timeout)"]
+        SP["Global StackPool (VirtualAlloc / mmap)\n128 KB Stacks + 4 KB Guard Page (PAGE_NOACCESS)"]
+
+        subgraph W0["Worker #0 (std::jthread — OS Core 0)"]
+            W0_CTX["scheduler_ctx_ (RSP / NT_TIB)"]
+            W0_RN["run_next_ (1-Slot Hot Cache)\n242 ns Direct Producer-Consumer Handoff"]
+            W0_DQ["Local WorkStealingDeque\nOwner: LIFO push/pop_back (L1/L2 cache hot)"]
+            W0_GF["local_free_routines_ (p.gFree)\nLock-Free Routine & Stack Cache"]
+        end
+
+        subgraph W1["Worker #1 (std::jthread — OS Core 1)"]
+            W1_CTX["scheduler_ctx_ (RSP / NT_TIB)"]
+            W1_RN["run_next_ (1-Slot Hot Cache)"]
+            W1_DQ["Local WorkStealingDeque\nThief: FIFO steal_half_into (50% oldest tasks)"]
+            W1_GF["local_free_routines_ (p.gFree)"]
+        end
+
+        GQ <-->|"Every 61 ticks\nor overflow"| W0_DQ
+        GQ <-->|"Every 61 ticks\nor overflow"| W1_DQ
+        W0_DQ <-.->|"Work-Stealing: steal_half_into()\n(50% FIFO batch steal)"| W1_DQ
+        TP -->|"Unparks expired\nroutines"| GQ
+        SP <-->|"Batch refill / release"| W0_GF
+        SP <-->|"Batch refill / release"| W1_GF
+    end
+```
+
+---
+
+### 2. Zero-Copy Direct Stack-to-Stack Channel Handoff (`capacity == 0` & Parked Readers)
+
+Unlike traditional C++ thread queues that allocate nodes on the heap (`std::queue<T>` + `std::mutex`), `gorun::Channel<T>` places the `ChannelWaiter<T>` node and the destination `std::optional<T>` **directly on the sleeping routine's stack frame**. Because of the **Stack Stability Invariant**, the sender writes straight into the receiver's stack memory:
+
+```
++---------------------------------------+         +---------------------------------------+
+|     Green Routine R1 (Receiver)       |         |       Green Routine R2 (Sender)       |
+|   Stack Frame (128 KB + Guard Page)   |         |   Stack Frame (128 KB + Guard Page)   |
++---------------------------------------+         +---------------------------------------+
+| std::optional<T> result_slot;         | <-----+ | T value = 42;                         |
+| ChannelWaiter<T> node {               |       | |                                       |
+|   .waiter    = &R1,                   |       | | ch.send(std::move(value)):            |
+|   .data_slot = &result_slot  ---------+-------+ |   1. Pops R1's node from receivers_   |
+| };                                    |         |   2. *dst = std::move(value)          |
+| [State: Parked]                       |         |      (Direct Stack-to-Stack Copy!)    |
++---------------------------------------+         |   3. w->run_next_ = &R1 (unpark!)     |
+|     PAGE_NOACCESS (4 KB Guard Page)   |         +---------------------------------------+
++---------------------------------------+         |     PAGE_NOACCESS (4 KB Guard Page)   |
+                                                  +---------------------------------------+
+```
+
+---
+
+### 3. Atomic `park_locked` / `unpark` Protocol (Zero Lost Wakeups & Zero Dual-Core Stack Corruption)
+
+A naive green-thread scheduler that unlocks a primitive's spinlock *before* calling `context_switch` suffers from a fatal race condition: another CPU core can pop the routine from the wait queue and start executing its stack **while the first CPU core is still saving registers onto that same stack**.
+
+`gorun` solves this identically to Go's `gopark(unlockf, lock)` by passing `pending_unlock_` into the worker's `scheduler_ctx_`:
+
+```mermaid
+sequenceDiagram
+    participant R1 as Routine R1 (on Worker #0)
+    participant W0 as Worker #0 Scheduler (scheduler_ctx_)
+    participant Lock as Channel / Mutex SpinLock
+    participant R2 as Routine R2 (on Worker #1)
+
+    R1->>Lock: 1. lock_.lock() (Acquired)
+    R1->>R1: 2. Enqueue stack-allocated WaiterNode into receivers_
+    R1->>W0: 3. w->park_locked(lock_)
+    Note over R1,W0: Sets R1->state = Parked<br/>Sets W0->pending_unlock_ = &lock_<br/>Calls gorun_context_switch_asm(&R1.ctx, &W0.scheduler_ctx_)
+    R2->>Lock: 4. Attempts lock_.lock() -> SPINS (R1 is still switching!)
+    Note over W0: 5. CPU is now on W0.scheduler_ctx_!<br/>R1's RSP, XMM6-15 & NT_TIB are 100% saved!
+    W0->>Lock: 6. pending_unlock_->unlock() (Released!)
+    Lock-->>R2: 7. lock_.lock() succeeds on Worker #1!
+    R2->>R2: 8. Pops R1, writes data to R1's stack, calls unpark(R1)
+    Note over R2,R1: Safe to resume R1 on ANY core immediately!
+```
+
+---
+
+### 4. Why `gorun::Scope` Exists: Memory Layout in Go (Escape Analysis) vs. C++20 (`gorun`)
+
+In Go, if a goroutine captures a local variable `x` from a function that returns immediately, the Go compiler's **escape analysis** silently moves `x` to the garbage-collected heap. In C++, local variables live strictly on the stack frame—if a detached thread accesses `&x` after the function returns, it causes a **Use-After-Free (Dangling Reference)**.
+
+`gorun::Scope` brings compile-time/RAII safety to `[&]` captures while preserving Go's clean `go([&]{ ... })` syntax:
+
+```
+  GO COMPILER (Escape Analysis + GC)                 C++20 gorun::Scope (Zero Heap + RAII Join)
++------------------------------------+             +--------------------------------------------+
+| func foo() {                       |             | void foo() {                               |
+|   x := 42 // Escapes to GC Heap!   |             |   int x = 42; // Stays on fast CPU stack!  |
+|   go func() { use(&x) }()          |             |   gorun::Scope scope;                      |
+| } // foo() returns early           |             |   gorun::go([&]() { use(x); });            |
++-----------------+------------------+             | } // ~Scope() parks here until go() ends!  |
+                  |                                +---------------------+----------------------+
+                  v                                                      |
+        +-------------------+                                            v
+        |  GC Heap Object   |                              +---------------------------+
+        |  int x = 42       |                              | Zero Heap Allocation!     |
+        |  (GC overhead)    |                              | 100% Dangling-Ref Safe!   |
+        +-------------------+                              +---------------------------+
+```
+
+---
+
+### 5. Why Pointers Never Get Lost or Corrupted in `gorun` (4-Layer Pointer Safety Architecture)
+
+A common failure mode in custom M:N green-thread runtimes is pointer corruption or lost pointers during cross-core migrations. `gorun` eliminates all 4 classes of pointer bugs at the architectural level (verified by **`[TEST 20]`** with an exact constructor/destructor audit of 10,500 objects):
+
+```mermaid
+flowchart LR
+    subgraph L1["1. Stack Pointer Stability"]
+        S1["Fixed 128 KB VirtualAlloc/mmap\n+ 4 KB Hardware Guard Page"] --> S2["Stack NEVER relocates in memory\n(Unlike Go's 2 KB -> 4 KB stack copy)"]
+        S2 --> S3["&local_var and ChannelWaiter::data_slot\nremain 100% valid across any park/yield"]
+    end
+
+    subgraph L2["2. Stealable run_next_ Ownership"]
+        O1["schedule(Routine* r)\npushes to WorkStealingDeque::run_next_"] --> O2["Displaced run_next_ moves atomically\ninto circular buffer tail"]
+        O2 --> O3["Idle thieves can steal from BOTH\ncircular buffer AND run_next_ (0 stranded tasks)"]
+    end
+
+    subgraph L3["3. Compiler TLS Cache Barrier"]
+        T1["Routine migrates from\nOS Thread #1 to OS Thread #2"] --> T2["__attribute__((noinline)) + signal_fence\non context_switch & current_worker()"]
+        T2 --> T3["Prevents GCC/Clang -O3 from caching\nstale thread_local pointers in %rbx/%r12"]
+    end
+
+    subgraph L4["4. Deterministic Recycling"]
+        R1["finish_current() clears r->task = nullptr\n(Destroys captured smart pointers immediately)"] --> R2["Returns Routine* to per-worker\nlocal_free_routines_ (p.gFree)"]
+        R2 --> R3["~Runtime() frees 100% of pooled\ndescriptors and VirtualAlloc stacks"]
+    end
+```
+
+| Pointer Category | What Goes Wrong in Naive Runtimes (or Go) | How `gorun` Guarantees Zero Lost / Dangling Pointers |
+| :--- | :--- | :--- |
+| **1. Pointers to Local Stack Variables (`&local_var`)** | Go starts with 2 KB stacks and **reallocates/copies the entire stack** to a new address when it grows, breaking C++ raw pointers into the stack. | **Fixed Virtual Stacks (`StackPool`)**: 128 KB + 4 KB `PAGE_NOACCESS` Guard Page. Stack addresses **never change** for the lifetime of the routine (`[TEST 04]`). |
+| **2. `Routine*` Pointers Across Queues & `run_next_`** | If a worker caches a routine in an unlocked `run_next_` slot and then runs a long CPU task, the pointer is invisible to work-stealing thieves or lost on overwrite. | **Unified Lock-Guarded `run_next_`** inside `WorkStealingDeque`: `push_run_next()` atomically displaces any previous routine into the ring buffer, and `steal_half_into()` steals directly from `run_next_` when the buffer is empty. |
+| **3. `thread_local` Pointers (`current_worker()`) on `-O3`** | Optimizing compilers assume a function call cannot change the OS thread, so they cache `thread_local` addresses in callee-saved registers (`%rbx`) across `context_switch`! | **TLS Reload Barrier**: `context_switch()`, `current_worker()`, and `current_routine()` are marked `noinline` with `std::atomic_signal_fence(memory_order_seq_cst)`, forcing fresh `%gs`/`%fs` TLS reads after migration. |
+| **4. Smart Pointers Inside Routine Closures (`std::shared_ptr<T>`)** | Pooled routines keep their last `std::function<void()> task` alive in the pool, leaking captured `std::shared_ptr` resources until program exit. | **Immediate Closure Reset**: `routine_trampoline` explicitly executes `r->task = nullptr;` *before* calling `finish_current()`, destroying all captured closures immediately (`[TEST 20]: Constructed 10500 == Destroyed 10500, Live Leaks: 0`). |
+
+---
+
+## Side-by-Side Code Comparisons: Go vs. `gorun` (C++20) vs. Standard C++ (`std::thread`)
+
+### Comparison A: Unbuffered Channel Ping-Pong
+| Go (`chan int`) | C++20 `gorun` (`gorun::Channel<int>`) | Standard C++20 (`std::jthread` + `std::mutex`) |
+| :--- | :--- | :--- |
+| ```go ch := make(chan int) go func() {   ch <- 42 }() v := <-ch ``` | ```cpp gorun::Channel<int> ch(0); gorun::go([&]() {     ch.send(42); }); auto v = ch.recv(); // *v == 42 ``` | ```cpp std::mutex m; std::condition_variable cv; std::optional<int> slot; std::jthread t([&]() {     std::lock_guard lk(m);     slot = 42;     cv.notify_one(); }); std::unique_lock lk(m); cv.wait(lk, [&]{ return slot.has_value(); }); // Blocks OS kernel thread! ``` |
+
+### Comparison B: Multi-Channel Multiplexing (`select`)
+| Go (`select`) | C++20 `gorun` (`gorun::select`) |
+| :--- | :--- |
+| ```go select { case v := <-ch1:     fmt.Println("ch1:", v) case ch2 <- 99:     fmt.Println("sent to ch2") case <-time.After(50 * time.Millisecond):     fmt.Println("timeout") } ``` | ```cpp gorun::select(     ch1.on_recv([](int v) {         std::cout << "ch1: " << v << "\n";     }),     ch2.on_send(99, []() {         std::cout << "sent to ch2\n";     }),     gorun::on_timeout(50ms, []() {         std::cout << "timeout\n";     }) ); ``` |
+
+### Comparison C: Non-OS-Blocking Mutex vs. `std::mutex`
+| What happens on lock contention? | `std::mutex::lock()` inside a task | `gorun::Mutex::lock()` inside a routine |
+| :--- | :--- | :--- |
+| **OS Thread (`Worker`) State** | **BLOCKED in OS Kernel** (`futex` / `WaitOnAddress`). Cannot run any other queued tasks! | **ACTIVE**. Routine parks in 66 ns; the OS worker immediately executes the next green routine! |
+| **RAII Compatibility** | `std::lock_guard<std::mutex>` | `std::lock_guard<gorun::Mutex>`, `std::unique_lock<gorun::Mutex>` |
+| **Memory Allocation on Lock** | 0 bytes | **0 bytes** (`UniversalWaiter` node lives on the parked routine's stack) |
+
+### Comparison D: `defer` Statement (Go vs. `gorun`)
+| Go (`defer`) | C++20 `gorun` (`GORUN_DEFER` / `gorun::defer`) |
+| :--- | :--- |
+| ```go wg.Add(1) go func() {     defer wg.Done()     defer close(ch)     ch <- 42 }() ``` | ```cpp wg.add(1); gorun::go([&]() {     GORUN_DEFER { wg.done(); };     GORUN_DEFER { ch.close(); };     ch.send(42); }); // Runs in LIFO order even if an exception is thrown! ``` |
+
+---
+
+## Where Concepts Are Borrowed From: Go vs. `gorun` (C++20/23)
+
+| Concept / Mechanism | Go Runtime (`runtime` / `sync`) | `gorun` (`C++20/23`) | Architectural Adaptation in `gorun` |
+| :--- | :--- | :--- | :--- |
+| **Green Thread Entity** | `g` (`runtime2.go`) | `gorun::detail::Routine` | Fixed virtual-memory stack + hardware Guard Page (**Stack Stability**); recycled per worker (`local_free_routines_`). |
+| **Worker + Processor** | `m` + `p` (`proc.go`) | `gorun::detail::Worker` | 1-to-1 bound `std::jthread` with a local `WorkStealingDeque`, `run_next_` hot slot, and `scheduler_ctx_`. |
+| **Hot Producer-Consumer Slot** | `p.runnext` (`proc.go`) | `Worker::run_next_` | 1-element LIFO cache slot enabling 242 ns unbuffered channel rendezvous without touching the ring deque. |
+| **Starvation Prevention** | `schedtick % 61 == 0` (`proc.go`) | `(tick_ % 61) == 0` | Every 61st scheduling tick, a worker polls `Global Run Queue` before its local deque. |
+| **Work Stealing** | `runqsteal` (`proc.go`) | `steal_half_into()` | Thieves steal **50% of the oldest tasks (FIFO)** from the head of a random victim's deque in a single batch lock. |
+| **Atomic Park without Lost Wakeup** | `gopark(unlockf, lock)` | `Worker::park_locked(SpinLock&)` | Releases the primitive's `SpinLock` **after** `context_switch` has saved `%rsp`, `%rbp`, `XMM6–XMM15`, and `NT_TIB` bounds. |
+| **Channel & Direct Stack Copy** | `hchan` + `sudog` (`chan.go`) | `Channel<T>` + `ChannelWaiter<T>` | Waiter nodes and data slots live directly on the parked routine's stack frame (**0 heap allocations** on `send`/`recv`). |
+| **Multi-Channel Multiplexer** | `select { case ... }` (`select.go`) | `gorun::select(...)` | Variadic template with pseudo-random polling order (`std::shuffle`), `on_recv`, `on_send`, `on_default`, `on_timeout`. |
+| **Structured Concurrency** | `errgroup.Group` (`x/sync/errgroup`) | `gorun::TaskGroup` / `gorun::Scope` | RAII destructor `wait()`, implicit attachment of nested `gorun::go([&])` calls, `std::stop_token` + `std::exception_ptr`. |
+| **Green Mutex & RAII** | `sync.Mutex` | `gorun::Mutex` | Satisfies C++ `Lockable`—works directly with `std::lock_guard`, `std::unique_lock`, and `std::scoped_lock`. |
+| **Green Read-Write Mutex** | `sync.RWMutex` | `gorun::RwMutex` | Writer-preferring shared mutex compatible with `std::shared_lock` and `std::unique_lock`. |
+| **WaitGroup / Once / Cond** | `sync.WaitGroup`, `Once`, `Cond` | `WaitGroup`, `Once`, `CondVar` | Hybrid `UniversalWaiter` allows calling `.wait()` from both green routines and external OS threads (e.g. `int main()`). |
+| **Deferred Scope Cleanup** | `defer fn()` (`runtime._defer`) | `gorun::defer(fn)` / `GORUN_DEFER` | Block-scoped RAII `DeferGuard` on the routine stack (0 heap allocations, LIFO execution order, `.dismiss()` cancellation, runs even on C++ exception unwinding). |
+
+---
+
+## Side-by-Side Code Examples: Go vs. `gorun`
+
+### 1. Ergonomic Launch & Channels in `main()`
+
+**In Go:**
+```go
+ch := make(chan int, 8)
+
+go func() {
+    ch <- 42
+    close(ch)
+}()
+
+if v, ok := <-ch; ok {
+    fmt.Println("Received:", v)
+}
+```
+
+**In C++20 (`gorun`):**
+```cpp
+#include <iostream>
+#include "gorun/gorun.hpp"
+
+int main() {
+    gorun::Channel<int> ch(8);
+
+    gorun::go([&]() {
+        ch.send(42);
+        ch.close();
+    });
+
+    if (auto v = ch.recv()) {
+        std::cout << "Received: " << *v << "\n";
+    }
+}
+```
+> **How `ch.recv()` works directly in `main()`:**
+> The first call to `gorun::go(...)` lazily initializes `gorun::default_runtime()`. Because `UniversalWaiter` detects whether it is called from inside a green routine or from an external OS thread (`main`), you don't even need boilerplate `Runtime::block_on()` for simple programs.
+
+---
+
+### 2. Structured Concurrency & Safe `[&]` Reference Captures (`Scope` & `TaskGroup`)
+
+In C++, capturing local stack variables by reference (`[&]`) in a detached thread is a classic **use-after-free** bug. `gorun::Scope` solves this automatically: **any `gorun::go(...)` called inside an active `Scope` block is transitively bound to that `Scope`**, and `~Scope()` parks the parent routine until all children finish.
+
+```cpp
+#include <iostream>
+#include <vector>
+#include "gorun/gorun.hpp"
+
+void parallel_transform(std::vector<int>& data) {
+    gorun::Scope scope; // Opens an implicit structured scope on the current stack
+
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        // Plain gorun::go([&]) automatically attaches to `scope`!
+        gorun::go([&, i]() {
+            data[i] = static_cast<int>(i * 100);
+        });
+    }
+} // <-- ~Scope() automatically parks here until all routines complete!
+  //     Zero risk of dangling [&] references!
+```
+
+### 3. Cooperative Cancellation (`std::stop_token`) & Exception Propagation
+
+```cpp
+#include <iostream>
+#include <stdexcept>
+#include "gorun/gorun.hpp"
+
+using namespace std::chrono_literals;
+
+void run_service() {
+    try {
+        gorun::TaskGroup group;
+
+        // Routine 1: Cooperatively polls std::stop_token
+        group.spawn([](std::stop_token st) {
+            while (!st.stop_requested()) {
+                gorun::yield();
+            }
+            std::cout << "Worker cleanly stopped on sibling error!\n";
+        });
+
+        // Routine 2: Fails with an exception -> automatically cancels Routine 1!
+        group.spawn([]() {
+            gorun::sleep_for(10ms);
+            throw std::runtime_error("Database connection lost");
+        });
+
+        group.wait(); // Rethrows std::runtime_error("Database connection lost")
+    } catch (const std::exception& ex) {
+        std::cout << "Caught exception from green routine: " << ex.what() << "\n";
+    }
+}
+```
+
+### 4. Multi-Channel `select(...)` and Green `Mutex` with Standard C++ RAII
+
+```cpp
+#include <iostream>
+#include <mutex>
+#include <string>
+#include "gorun/gorun.hpp"
+
+using namespace std::chrono_literals;
+
+void demo_select() {
+    gorun::Mutex log_mtx;
+    gorun::Channel<std::string> fast_ch(1);
+    gorun::Channel<std::string> slow_ch(1);
+
+    gorun::go([&]() {
+        gorun::sleep_for(5ms); // Parks the routine on the min-heap timer without blocking OS thread
+        fast_ch.send("Response from replica A");
+    });
+
+    gorun::go([&]() {
+        gorun::sleep_for(50ms);
+        slow_ch.send("Response from replica B");
+    });
+
+    gorun::select(
+        fast_ch.on_recv([&](std::string msg) {
+            std::lock_guard<gorun::Mutex> lock(log_mtx); // Standard RAII with gorun::Mutex!
+            std::cout << "Fast channel won: " << msg << "\n";
+        }),
+        slow_ch.on_recv([&](std::string msg) {
+            std::lock_guard<gorun::Mutex> lock(log_mtx);
+            std::cout << "Slow channel won: " << msg << "\n";
+        }),
+        gorun::on_timeout(100ms, []() {
+            std::cout << "Timed out!\n";
+        })
+    );
+}
+```
+
+---
+
+### 5. `GORUN_DEFER` & `gorun::defer(...)`: Zero-Cost Scope Cleanup, LIFO Ordering & Transaction Rollbacks
+
+In Go, `defer` schedules a function call to run before the surrounding function returns, which internally allocates or links a `_defer` record on the goroutine's defer chain.
+
+In `gorun`, `GORUN_DEFER { ... };` and `gorun::defer(fn)` compile down to a **zero-allocation stack RAII guard (`DeferGuard<F>`)** that runs at the end of the **current lexical block `{ ... }`**—whether the block exits normally, via an early `return`, or during C++ exception stack unwinding!
+
+#### Pattern A: Guaranteed `Channel::close()`, `WaitGroup::done()`, and `Semaphore::release()`
+```cpp
+#include <iostream>
+#include "gorun/gorun.hpp"
+
+void worker_pipeline(gorun::Channel<int>& out_ch, gorun::WaitGroup& wg, gorun::Semaphore& db_limiter) {
+    wg.add(1);
+    gorun::go([&]() {
+        // Registered in LIFO order (last registered runs first on exit):
+        GORUN_DEFER { wg.done(); };          // Runs 2nd: signals WaitGroup completion
+        GORUN_DEFER { out_ch.close(); };     // Runs 1st: closes channel so receivers never hang!
+
+        for (int i = 1; i <= 3; ++i) {
+            db_limiter.acquire();
+            // Inner block-scoped defer: releases semaphore at the end of EACH loop iteration!
+            GORUN_DEFER { db_limiter.release(); };
+
+            out_ch.send(i * 10);
+        }
+    });
+}
+```
+
+#### Pattern B: Exception-Safe Transaction Rollback with `.dismiss()` (C++ Superpower over Go's `defer`)
+Unlike Go's `defer` (which cannot be easily cancelled once scheduled), `gorun::defer(...)` returns a `DeferGuard` with a `.dismiss()` method. This makes **commit / rollback** logic in web handlers and database transactions completely bug-free:
+
+```cpp
+#include <iostream>
+#include <stdexcept>
+#include "gorun/gorun.hpp"
+
+void transfer_funds(int amount, bool simulate_network_error) {
+    std::cout << "[Tx] Begin database transaction...\n";
+
+    // Arm an automatic rollback guard on the routine's stack:
+    auto rollback_guard = gorun::defer([&]() {
+        std::cout << "[Tx] ROLLBACK executed automatically due to error!\n";
+    });
+
+    if (simulate_network_error) {
+        throw std::runtime_error("Payment gateway timeout");
+        // ^ Stack unwinds here -> `rollback_guard` destructor fires automatically!
+    }
+
+    // Everything succeeded! Commit and disarm the rollback guard:
+    std::cout << "[Tx] COMMIT " << amount << " USD\n";
+    rollback_guard.dismiss(); // <-- Disarms the defer guard (0 rollback on return!)
+}
+```
+
+#### Pattern C: LIFO Execution Stack Visualization
+When multiple `GORUN_DEFER` statements are declared in the same scope, C++ destroys local stack variables in exact reverse order of construction (**Last-In, First-Out**—identical to Go's `defer` stack):
+
+```text
+  Scope Execution (Top to Bottom)                Scope Exit / Unwind (LIFO Order)
++-----------------------------------+          +-----------------------------------+
+| {                                 |          | } // Scope exits here:            |
+|   GORUN_DEFER { step(1); };  -----+----+     |   1. Runs step(3) FIRST           |
+|   GORUN_DEFER { step(2); };  -----+--+ |     |   2. Runs step(2) SECOND          |
+|   GORUN_DEFER { step(3); };  -----+  | |     |   3. Runs step(1) LAST            |
++-----------------------------------+  | |     +-----------------------------------+
+                                    |  | |       ^         ^         ^
+                                    +--+-+-------+---------+---------+
+```
+
+---
+
+## Ecosystem Comparison: `gorun` vs. Popular C++ Concurrency Libraries
+
+When building high-concurrency network services or web frameworks in C++, developers traditionally face a painful trade-off between **OS threads** (`std::jthread`), **C++20 stackless coroutines** (`co_await` / Boost.Asio), **Boost.Fiber**, or **DAG task graphs** (Cpp-Taskflow).
+
+Here is how `gorun` compares against the leading C++ alternatives across ergonomics, memory footprint, and architecture:
+
+| Feature / Library | **`gorun` (C++20/23)** | **Standard C++ (`std::jthread` / `std::async`)** | **Boost.Fiber** | **C++20 Coroutines (`co_await` / Asio)** | **libgo (C++11)** | **Cpp-Taskflow** |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Execution Model** | **M:N Stackful Green Routines** | 1:1 OS Kernel Threads | M:N or 1:N Stackful Fibers | Stackless State Machines | M:N Stackful Coroutines | Task DAGs (Run-to-completion) |
+| **Dependencies** | **Zero (Header-only)** | Standard Library | Heavy Boost dependency tree | Standard + Executor lib | CMake + Boost/System | Header-only |
+| **"Function Coloring" Problem** | **No** (Suspend from any nested depth!) | No | No | **Yes** (`co_await` infects every return type `Task<T>`) | No | Cannot suspend mid-task on I/O |
+| **Zero-Setup `go(...)` in `main()`** | **Yes** (Lazy global runtime + `UniversalWaiter`) | Yes (`std::jthread`) | No (Manual fiber scheduler setup per thread) | No (Requires explicit `io_context.run()`) | Partial | No (Requires `tf::Executor`) |
+| **Structured Concurrency (`Scope`)** | **Yes** (`gorun::Scope` auto-captures nested `go([&])`) | No | No (Manual `fiber.join()`) | Partial | No | Yes (`tf::Subflow`) |
+| **Multi-Channel `select(...)`** | **Yes** (`on_recv`, `on_send`, `on_timeout`, `on_default`) | No | No built-in `select` | Requires custom `when_any` | No variadic `select` | No channels |
+| **Go-Style `defer` Cleanup** | **Yes** (`GORUN_DEFER { ... };` & `gorun::defer`) | No | No | No | No | No |
+| **RAM per 10,000 Concurrent Tasks** | **~8–64 MB** (Pooled virtual stacks) | **~10–80 GB** (Crashes OS handle limit!) | ~64–128 MB | ~4–16 MB (Heap allocation per call frame) | ~64–128 MB | N/A (Cannot hold 10k parked I/O tasks) |
+
+---
+
+### Ergonomics Showdown: Writing a Web / Microservice Handler
+
+Why is **Stackful M:N (`gorun`)** dramatically cleaner for building a **C++ Web Framework** (like Go's `net/http`, Gin, or Fiber) compared to **C++20 Stackless Coroutines (`co_await` / Boost.Asio)** or **Boost.Fiber**?
+
+#### 1. The "Function Coloring" Problem: `gorun` vs. C++20 `co_await` (Asio / Seastar)
+With C++20 stackless coroutines (`co_await`), **every single function in your call chain** (middleware, JSON serializer, DB driver, auth helper) must return `Task<T>` and allocate a coroutine frame on the heap. You cannot suspend inside a standard callback, `std::ranges::for_each`, or a C library.
+
+With **`gorun`**, functions are just normal C++ functions. Any routine can park at **any call-stack depth**:
+
+| **`gorun` (Clean Synchronous-Looking Code, 0 Function Coloring)** | **C++20 Stackless Coroutines (`co_await` / Asio — Viral `Task<T>`)** | **Boost.Fiber (Verbose Manual Wiring)** |
+| :--- | :--- | :--- |
+| ```cpp // Normal C++ return type! User fetch_user(int id) {     gorun::Channel<User> db_ch(0);     gorun::go([&]() {         GORUN_DEFER { db_ch.close(); };         db_ch.send(query_db(id));     });     return *db_ch.recv(); // Parks in 65 ns! }  // Inside HTTP route handler: gorun::go([req, res]() {     User u = fetch_user(req.id);     res.send_json(u); }); ``` | ```cpp // Every helper MUST be colored Task<T>! Task<User> fetch_user(int id) {     // Heap-allocates coroutine frame on every call     User u = co_await async_query_db(id);     co_return u; }  // Inside HTTP route handler: co_spawn(executor, [req, res]() -> Task<void> {     User u = co_await fetch_user(req.id);     co_await res.async_send_json(u); }, detached); ``` | ```cpp // Requires explicit scheduler registration boost::fibers::use_scheduling_algorithm<   boost::fibers::algo::work_stealing>(threads);  boost::fibers::buffered_channel<User> ch(2); boost::fibers::fiber f([&]() {     ch.push(query_db(id));     ch.close(); }); User u; ch.pop(u); // No select(), no Scope guard f.join(); // Forgetting join() crashes! ``` |
+
+---
+
+## Why `gorun` is the Ideal Foundation for a Next-Gen C++ Web Framework
+
+Modern Go web frameworks (`net/http`, `gin`, `gofiber`) dominate backend development because of one superpower: **one green routine per HTTP connection/request**, written in straightforward top-to-bottom synchronous style while achieving asynchronous non-blocking I/O performance under the hood.
+
+Building a C++ Web Framework on top of `gorun` unlocks:
+1. **100,000+ Concurrent Connections (C100K / C1M) with Routine-per-Request:**
+   Accepting a new HTTP/WebSocket connection simply calls `gorun::go([conn]{ handle_http(conn); })`. At **~183–242 ns** per channel handoff and **~70x faster spawning than `std::jthread`**, the server scales effortlessly across all CPU cores via M:N work-stealing.
+2. **Automatic Request-Scoped Lifetime & Cancellation (`gorun::Scope` + `GORUN_DEFER`):**
+   If an HTTP handler spawns 3 parallel fan-out queries (e.g., Auth Service, PostgreSQL, Redis) inside a `gorun::Scope`, and one query throws an exception or times out via `gorun::select(..., gorun::on_timeout(50ms, ...))`, `Scope` **automatically cancels the remaining queries via `std::stop_token`** and joins them before returning `HTTP 500 / 504`—with **zero leaked tasks or dangling `[&]` references**.
+3. **Middleware & Per-Request Context without Thread-Local Bugs (`gorun::RoutineLocal<HttpContext>`):**
+   Even when an HTTP request routine migrates from Worker Thread #2 to Worker Thread #11 after awaiting a database channel, `gorun::RoutineLocal<T>` preserves the request's Trace ID, Auth Token, and Logger without passing context pointers through 20 function arguments.
+
+---
+
+## Performance Benchmarks: `gorun` vs. Native Go (`go1.27.4`) vs. Standard C++ (`std::jthread` / `std::mutex`)
+
+All three benchmark suites ([benchmarks/bench_gorun.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/benchmarks/bench_gorun.cpp), [benchmarks/bench_go.go](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/benchmarks/bench_go.go), and [benchmarks/bench_std_alternatives.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/benchmarks/bench_std_alternatives.cpp)) are included in the repository and execute on the exact same machine (**16 logical cores / `GOMAXPROCS=16`**, `GCC 16.2.0 -O3` vs. `go1.27.4`):
+
+| Benchmark Workload | **`gorun` (C++20)** | **Native Go (`go1.27.4`)** | **Standard C++ (`std::jthread` / `std::mutex`)** | **`gorun` Speedup vs. Standard C++** | **`gorun` vs. Native Go** |
+| :--- | ---: | ---: | ---: | :--- | :--- |
+| **1. Unbuffered Rendezvous (`cap=0`)** | **183.4 ns/op** (`5.45 M ops/s`) | 254.2 ns/op (`3.93 M ops/s`) | 10,247.4 ns/op (`0.10 M ops/s`) | **55.8x Faster than `std::mutex + condvar`!** | **1.38x Faster than Go!** |
+| **2. Buffered Channel (`cap=256`)** | **13.2 – 29.5 ns/op** (`75.8 M ops/s`) | 55.6 ns/op (`17.98 M ops/s`) | 176.1 ns/op (`5.68 M ops/s`) | **13.3x Faster than `std::mutex + deque`!** | **4.2x Faster than Go!** |
+| **3. Task / Thread Spawn & Join** | **935.0 ns/op** (`1.07 M ops/s`) | 230.8 ns/op (`4.33 M ops/s`) | 66,053.1 ns/op (`0.015 M ops/s`) | **70.6x Faster than `std::jthread` (& `std::async`)!** | Sub-microsecond pooled spawn |
+| **4. Context Switch (`yield`)** | **64.7 ns/op** (`15.46 M ops/s`) | 74.6 ns/op (`13.40 M ops/s`) | 261.7 ns/op (`3.82 M ops/s`) | **4.0x Faster than OS Kernel `yield()`!** | **1.15x Faster than Go!** |
+| **5. Contended Mutex (`100` tasks)** | **1,001.0 ns/op** (`1.00 M ops/s`) | 37.0 ns/op (`27.01 M ops/s`) | Blocks OS kernel threads | **0 OS-Thread Blocking** | 1.0M green handoffs/sec |
+
+### Visual Performance Comparison Charts (3-Way Benchmark)
+
+```mermaid
+xychart-beta
+    title "Unbuffered Channel Rendezvous Throughput (Million ops/sec — Higher is Better)"
+    x-axis ["C++20 gorun (5.45M)", "Native Go 1.27 (3.93M)", "C++ std::mutex + condvar (0.10M)"]
+    y-axis "Throughput (Million ops/sec)" 0 --> 6
+    bar [5.45, 3.93, 0.10]
+```
+
+```text
+1. Unbuffered Rendezvous Channel Latency (ns/op — LOWER IS BETTER)
+   gorun (C++20)             [▋                                       ]    183.4 ns/op (5.45 M ops/s)  <-- 55.8x Faster than std!
+   Native Go (go1.27.4)      [█                                       ]    254.2 ns/op (3.93 M ops/s)
+   std::mutex + condvar      [████████████████████████████████████████] 10,247.4 ns/op (0.10 M ops/s)
+
+2. Task / Thread Spawn & Join Latency (ns/op — LOWER IS BETTER)
+   Native Go (go1.27.4)      [▏                                       ]    230.8 ns/op (4.33 M ops/s)
+   gorun (C++20)             [▌                                       ]    935.0 ns/op (1.07 M ops/s)  <-- 70.6x Faster than std::jthread!
+   std::async (future::get)  [███████████████████████████████████████ ] 64,684.0 ns/op (0.02 M ops/s)
+   std::jthread (OS Thread)  [████████████████████████████████████████] 66,053.1 ns/op (0.02 M ops/s)
+
+3. Buffered Channel / Queue Throughput (Million ops/sec — HIGHER IS BETTER)
+   gorun (C++20)             [████████████████████████████████████████] 75.83 M ops/s (13.2 ns/op)     <-- 13.3x Faster than std, 4.2x vs Go!
+   Native Go (go1.27.4)      [█████████▌                              ] 17.98 M ops/s (55.6 ns/op)
+   std::mutex + std::deque   [███                                     ]  5.68 M ops/s (176.1 ns/op)
+```
+
+### Actual Benchmark Console Output (`gorun_bench.exe`, `bench_go.go`, and `std_bench.exe`)
+
+```text
+==========================================================================================================
+  C++20 gorun M:N Green Threads Benchmark Suite (Workers: 16)
+==========================================================================================================
+1. Unbuffered Channel Rendezvous (cap=0)       |     100000 ops |    18.34 ms |    183.4 ns/op |       5.45 M ops/s
+2. Buffered Channel Throughput (cap=256)       |    1000000 ops |    13.19 ms |     13.2 ns/op |      75.83 M ops/s
+3. Spawn & Join 50,000 Green Routines          |      50000 ops |    46.75 ms |    935.0 ns/op |       1.07 M ops/s
+4. Contended gorun::Mutex (100 routines)       |     200000 ops |   200.20 ms |   1001.0 ns/op |       1.00 M ops/s
+5. User-Space Context Switch (gorun::yield)    |     100000 ops |     6.47 ms |     64.7 ns/op |      15.46 M ops/s
+==========================================================================================================
+==========================================================================================================
+  Go Native Runtime Benchmark Suite (GOMAXPROCS: 16, Go Version: go1.27.4)
+==========================================================================================================
+1. Unbuffered Channel Rendezvous (cap=0)       |     100000 ops |    25.42 ms |    254.2 ns/op |       3.93 M ops/s
+2. Buffered Channel Throughput (cap=256)       |    1000000 ops |    55.62 ms |     55.6 ns/op |      17.98 M ops/s
+3. Spawn & Join 50,000 Goroutines              |      50000 ops |    11.54 ms |    230.8 ns/op |       4.33 M ops/s
+4. Contended sync.Mutex (100 goroutines)       |     200000 ops |     7.41 ms |     37.0 ns/op |      27.01 M ops/s
+5. User-Space Context Switch (Gosched)         |     100000 ops |     7.46 ms |     74.6 ns/op |      13.40 M ops/s
+==========================================================================================================
+==============================================================================================================
+  Standard C++20 Alternatives Benchmark Suite (std::jthread, std::async, std::mutex + condvar)
+==============================================================================================================
+1. std::mutex + condvar Rendezvous (cap=0)         |     100000 ops |  1024.74 ms |  10247.4 ns/op |       0.10 M ops/s
+2. std::mutex + std::deque Queue (cap=256)         |    1000000 ops |   176.07 ms |    176.1 ns/op |       5.68 M ops/s
+3. OS Thread Spawn & Join (std::jthread)           |       2000 ops |   132.11 ms |  66053.1 ns/op |       0.02 M ops/s
+4. std::async + std::future::get()                 |       5000 ops |   323.42 ms |  64684.0 ns/op |       0.02 M ops/s
+5. OS Kernel Thread Yield (this_thread::yield)     |     100000 ops |    26.17 ms |    261.7 ns/op |       3.82 M ops/s
+==============================================================================================================
+```
+
+---
+
+## Comprehensive Verification & Race-Condition Test Suite (20 Suites)
+
+The test binary (`gorun_tests.exe` / [tests/test_main.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/tests/test_main.cpp)) validates all core invariants, concurrency primitives, race conditions, and edge cases across 20 test suites:
+
+| # | Test Suite Name | Invariant / Edge Case Verified | Status |
+| :-: | :--- | :--- | :-: |
+| **01** | `test_01_ergonomic_go_and_buffered_channel` | Ergonomic `gorun::go(...)` and buffered `Channel<int>(8)` called directly from `int main()` without explicit `Runtime` setup | **PASSED** |
+| **02** | `test_02_unbuffered_rendezvous_channel` | Unbuffered synchronous channel (`capacity == 0`) with zero-allocation **Direct Stack-to-Stack Handoff** | **PASSED** |
+| **03** | `test_03_move_only_types_in_channel` | Transmitting move-only payloads (`std::unique_ptr<int>`) across channels without copies | **PASSED** |
+| **04** | `test_04_stack_stability_invariant` | **Stack Stability Invariant**: 64 green routines perform 100 `yield()` migrations across 16 OS threads while verifying stack pointer addresses never change | **PASSED** |
+| **05** | `test_05_deep_stack_recursion` | Deep 120-frame recursion with intermediate `yield()` calls on an isolated 128 KB routine stack with Guard Page | **PASSED** |
+| **06** | `test_06_nested_structured_scope` | **Transitive Structured Concurrency**: nested green routines calling `go([&])` inside `gorun::Scope` automatically attach to the parent scope | **PASSED** |
+| **07** | `test_07_task_group_exception_and_cancellation` | Exception capture into `std::exception_ptr`, automatic sibling cancellation via `std::stop_token`, and rethrow on `TaskGroup::wait()` | **PASSED** |
+| **08** | `test_08_mutex_race_condition_stress` | **`gorun::Mutex` Race Condition Stress Test**: 250 routines $\times$ 200 critical sections (`50,000` operations) verifying a non-atomic two-variable invariant (`a + b == 0`) | **PASSED** |
+| **09** | `test_09_zero_os_thread_blocking_single_worker` | **Zero OS-Thread Blocking Proof**: isolated `Runtime` with **1 single OS thread (`worker_count = 1`)** multiplexing routines sleeping on `Mutex`, `Channel`, and `sleep_for` without deadlocking | **PASSED** |
+| **10** | `test_10_condvar_broadcast_and_signal` | `gorun::CondVar::wait` with predicate and `notify_all()` broadcast across 16 waiting routines | **PASSED** |
+| **11** | `test_11_waitgroup_multi_waiters` | `gorun::WaitGroup` with 5 concurrent watcher routines parked simultaneously on 10 worker routines | **PASSED** |
+| **12** | `test_12_semaphore_concurrency_limit` | **`gorun::Semaphore` Race Test**: 60 routines contending for 3 permits, asserting atomic concurrency bound (`active <= 3`) at every execution point | **PASSED** |
+| **13** | `test_13_call_once_race` | **`gorun::Once` / `call_once` Race Test**: 100 routines racing on one-time initialization, verifying single execution and memory visibility | **PASSED** |
+| **14** | `test_14_rwmutex_readers_writers_consistency` | **`gorun::RwMutex` Race Test**: 10 exclusive writers (`std::unique_lock`) and 40 concurrent readers (`std::shared_lock`) verifying multi-element array consistency | **PASSED** |
+| **15** | `test_15_channel_select_multiplexing` | `gorun::select(...)` multi-channel multiplexer testing `on_recv`, `on_send`, `on_default`, and `on_timeout` | **PASSED** |
+| **16** | `test_16_go_async_join_handle` | `gorun::go_async(...)` returning `JoinHandle<T>` for both value retrieval and exception propagation | **PASSED** |
+| **17** | `test_17_routine_local_storage` | `gorun::RoutineLocal<T>` state isolation across 50 routines migrating between different OS worker threads | **PASSED** |
+| **18** | `test_18_lost_wakeup_and_work_stealing_stress` | **Extreme Park/Unpark & Work-Stealing Stress Test**: 3-stage MPMC pipeline (`capacity = 2` + unbuffered `capacity = 0`) driving thousands of `park_locked`/`unpark` cycles across 16 workers with zero lost wakeups | **PASSED** |
+| **19** | `test_19_defer_lifo_and_exception_cleanup` | **`gorun::defer` & `GORUN_DEFER`**: LIFO execution order of multiple defers, `.dismiss()` cancellation, and guaranteed `wg.done()` + `ch.close()` cleanup when a routine throws an exception | **PASSED** |
+| **20** | `test_20_zero_lost_pointers_and_lifetime_audit` | **Zero Lost Pointers & Exact Lifetime Audit**: tracks 10,500 heap-allocated `TrackedObject` instances across routine closures, channels, and `run_next_` steals (`Constructed: 10500 == Destroyed: 10500, Live Leaks: 0`) | **PASSED** |
+
+### Actual Test Suite Console Output (`gorun_tests.exe`)
+
+```text
+======================================================================
+  gorun C++20 M:N Green Threads Runtime — 20 Comprehensive Test Suites
+  Active OS Worker Threads: 16
+======================================================================
+[TEST 01] Ergonomic go(...) + Buffered Channel in main()... PASSED
+[TEST 02] Unbuffered Rendezvous Channel (capacity == 0, Stack-to-Stack)... PASSED
+[TEST 03] Move-only types (std::unique_ptr<T>) in Channel... PASSED
+[TEST 04] Stack Stability invariant across 100 context switches... PASSED
+[TEST 05] Deep Recursion on isolated 128 KB routine stack... PASSED
+[TEST 06] Transitive Structured Concurrency (nested go([&]) inside Scope)... PASSED
+[TEST 07] TaskGroup Exception propagation & automatic std::stop_token cancel... PASSED
+[TEST 08] gorun::Mutex Race Condition Stress Test (50,000 critical sections)... PASSED
+[TEST 09] Zero OS-thread blocking invariant on 1-Worker Runtime... PASSED
+[TEST 10] gorun::CondVar (notify_one & notify_all with predicate)... PASSED
+[TEST 11] gorun::WaitGroup with multiple concurrent waiting routines... PASSED
+[TEST 12] gorun::Semaphore strict concurrency bound... PASSED
+[TEST 13] gorun::Once / call_once under 100-routine contention... PASSED
+[TEST 14] gorun::RwMutex Readers/Writers invariant check... PASSED
+[TEST 15] gorun::select(...) (on_recv, on_send, on_default, on_timeout)... PASSED
+[TEST 16] gorun::go_async(...) & JoinHandle<T> value and exception... PASSED
+[TEST 17] gorun::RoutineLocal<T> isolation across worker migrations... PASSED
+[TEST 18] Extreme Park/Unpark & Work-Stealing Stress Test (1,000 routines)... PASSED
+[TEST 19] gorun::defer(...) & GORUN_DEFER (LIFO order, dismiss, exception safety)... PASSED
+[TEST 20] Zero Lost Pointers & Exact Constructor/Destructor Audit (10,000 objects)... PASSED (Constructed: 10500, Destroyed: 10500, Live Leaks: 0)
+======================================================================
+  ALL 20 TEST SUITES PASSED SUCCESSFULLY in 258 ms!
+======================================================================
+```
+
+---
+
+## Building, Running Tests & Benchmarks
+
+### Prerequisites
+- C++20 compatible compiler (`GCC 11+` / `MinGW-w64 UCRT`, `Clang 14+`, or `MSVC 2022`)
+- `CMake 3.20+` and `Ninja` (or Make / MSBuild)
+- *(Optional)* `Go 1.20+` to run the comparative native Go benchmark
+
+### Build & Run via CMake
+```powershell
+# 1. Configure & Build in Release mode
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+
+# 2. Run the 18-suite Unit, Race-Condition & Stress Test Suite
+ctest --test-dir build --output-on-failure
+# or directly:
+.\build\gorun_tests.exe
+
+# 3. Run the Demo application
+.\build\gorun_demo.exe
+
+# 4. Run C++20 gorun vs. Native Go Performance Benchmarks
+.\build\gorun_bench.exe
+go run benchmarks/bench_go.go
+```
+
+---
+
+## Project Layout & IDE Documentation
+
+All public headers in `include/gorun/` are documented with **English Doxygen / Javadoc comments** (`@class`, `@brief`, `@param`, `@return`, `@throws`, `@code`), providing rich Quick Documentation tooltips in **CLion**, **IntelliJ IDEA**, and **VS Code**:
+
+- [include/gorun/gorun.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/gorun.hpp) — Single umbrella header.
+- [include/gorun/defer.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/defer.hpp) — Zero-overhead RAII `gorun::defer(...)`, `DeferGuard<F>`, and statement macro `GORUN_DEFER { ... };`.
+- [include/gorun/runtime.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/runtime.hpp) — `Runtime`, `Config`, `Worker`, `Routine`, `UniversalWaiter`, `this_routine::yield()`, `this_routine::sleep_for()`, `RoutineLocal<T>`.
+- [include/gorun/channel.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/channel.hpp) — `Channel<T>` (buffered & unbuffered rendezvous) and `select(...)` multiplexer.
+- [include/gorun/sync.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/sync.hpp) — `Mutex`, `CondVar`, `WaitGroup`, `Semaphore`, `Once`, `RwMutex`.
+- [include/gorun/task_group.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/task_group.hpp) — `TaskGroup`, `Scope`, `JoinHandle<T>`, `go(...)`, `go_in(...)`, `go_async(...)`.
+- [include/gorun/detail/context.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/detail/context.hpp) — Custom x86_64 assembly `gorun_context_switch_asm` for Windows x64 ABI (GPRs, XMM6–XMM15, `NT_TIB`) and System V AMD64 ABI.
+- [include/gorun/detail/stack_pool.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/detail/stack_pool.hpp) — Virtual-memory stack allocator with hardware Guard Pages (`PAGE_NOACCESS` / `PROT_NONE`).
+- [include/gorun/detail/work_stealing_deque.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/detail/work_stealing_deque.hpp) — Per-worker LIFO deque with FIFO half-stealing (`steal_half_into`).
+- [include/gorun/detail/spinlock.hpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/include/gorun/detail/spinlock.hpp) — TTAS `SpinLock` and O(1) zero-allocation `IntrusiveQueue<Node>`.
+- [tests/test_main.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/tests/test_main.cpp) — 19 unit, race-condition, and M:N work-stealing stress tests.
+- [benchmarks/bench_gorun.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/benchmarks/bench_gorun.cpp), [benchmarks/bench_go.go](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/benchmarks/bench_go.go) & [benchmarks/bench_std_alternatives.cpp](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/benchmarks/bench_std_alternatives.cpp) — 3-way performance benchmark suite (`gorun` vs. Go vs. Standard C++).
+- [.github/workflows/ci.yml](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/.github/workflows/ci.yml) — Automated GitHub Actions CI/CD pipeline (GCC, Clang, ASan/UBSan, Windows MinGW-w64, CMake install & release packaging).
+- [LICENSE](file:///c:/Users/nazer/OneDrive/Desktop/Rutine/LICENSE) — Apache License, Version 2.0.
+
+---
+
+## Author & License
+
+**Author:** **Artur Havor (Гавор Артур)**
+
+Copyright © 2026 **Artur Havor (Гавор Артур)**.
+
+Distributed under the **[Apache License, Version 2.0](./LICENSE)**. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0.

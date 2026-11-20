@@ -1,0 +1,95 @@
+name: CI/CD — Build, Test & Release
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*.*.*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "Ubuntu 24.04 (GCC 13, Release)"
+            os: ubuntu-latest
+            compiler: g++
+            build_type: Release
+          - name: "Ubuntu 24.04 (Clang 18, Release)"
+            os: ubuntu-latest
+            compiler: clang++
+            build_type: Release
+          - name: "Ubuntu 24.04 (GCC 13, AddressSanitizer + UBSan)"
+            os: ubuntu-latest
+            compiler: g++
+            build_type: Debug
+            cxx_flags: "-fsanitize=address,undefined -fno-omit-frame-pointer"
+          - name: "Windows x64 (MinGW-w64 GCC, Release)"
+            os: windows-latest
+            compiler: g++
+            build_type: Release
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
+            -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}" \
+            -DGORUN_BUILD_TESTS=ON \
+            -DGORUN_BUILD_EXAMPLES=ON \
+            -DGORUN_BUILD_BENCHMARKS=ON
+        shell: bash
+
+      - name: Build Targets
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+        shell: bash
+
+      - name: Run 19 Comprehensive Unit & Race-Condition Test Suites
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
+        shell: bash
+
+      - name: Run Performance Benchmarks (Release Only)
+        if: matrix.build_type == 'Release'
+        run: ./build/gorun_bench
+        shell: bash
+
+      - name: Verify CMake Package Installation
+        run: cmake --install build --prefix ./install_prefix
+        shell: bash
+
+  release-package:
+    name: Publish Single-Header & Archive Release
+    needs: build-and-test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Package Header-Only Release Archive
+        run: |
+          mkdir -p dist/gorun
+          cp -r include cmake CMakeLists.txt LICENSE README.md dist/gorun/
+          cd dist
+          tar -czvf gorun-${GITHUB_REF_NAME}-header-only.tar.gz gorun
+          zip -r gorun-${GITHUB_REF_NAME}-header-only.zip gorun
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/gorun-${{ github.ref_name }}-header-only.tar.gz
+            dist/gorun-${{ github.ref_name }}-header-only.zip
+          generate_release_notes: true
