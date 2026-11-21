@@ -222,10 +222,14 @@ public:
 
 /**
  * @file stack_pool.hpp
- * @brief Virtual memory stack allocator and recycling pool (`StackPool`) with hardware Guard Pages.
+ * @brief Multi-bucket virtual-memory stack allocator and recycling pool (`StackPool`) with
+ *        hardware Guard Pages, configurable per-routine stack sizes (`StackSize`, `Options`),
+ *        and observability counters (`StackPoolStats`).
  */
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -247,43 +251,87 @@ public:
 #include <unistd.h>
 #endif
 
-namespace gorun::detail {
+namespace gorun {
+
+/**
+ * @enum StackSize
+ * @brief Predefined stack size classes for launching green routines with `gorun::go(StackSize::Small, fn)`.
+ */
+enum class StackSize : std::size_t {
+    Small   = 16 * 1024,       ///< 16 KB  — lightweight tasks & high-density fan-out
+    Compact = 64 * 1024,       ///< 64 KB  — medium tasks & simple network handlers
+    Default = 128 * 1024,      ///< 128 KB — general-purpose handlers & I/O
+    Medium  = 256 * 1024,      ///< 256 KB — deeper call stacks / parsing
+    Large   = 512 * 1024,      ///< 512 KB — heavy recursion / large stack buffers
+    Huge    = 2 * 1024 * 1024  ///< 2 MB   — deep recursion or C library interop
+};
+
+/**
+ * @struct Options
+ * @brief Per-routine spawn configuration passed to `gorun::go(Options{.stack_size = ...}, fn)`.
+ */
+struct Options {
+    std::size_t stack_size{0}; ///< Requested usable stack size in bytes (`0` = Runtime's `default_stack_size`)
+};
+
+/**
+ * @struct StackPoolStats
+ * @brief Snapshot of virtual-memory stack pool allocations and cache reuse.
+ */
+struct StackPoolStats {
+    std::size_t pooled_stacks{0};           ///< Idle stacks currently cached across all size buckets
+    std::size_t pooled_bytes{0};            ///< Total usable stack bytes currently cached in pool
+    std::uint64_t total_allocated{0};       ///< Total OS `VirtualAlloc`/`mmap` stack allocations
+    std::uint64_t total_reused{0};          ///< Total pool cache hits (avoided OS syscalls)
+};
+
+namespace detail {
 
 /**
  * @struct StackAllocation
  * @brief Descriptor for an OS-allocated green routine stack with an inaccessible hardware Guard Page at the bottom.
  *
- * Guarantees the **Stack Stability** invariant: unlike Go's growable/relocatable stacks (which invalidate
- * interior pointers unless escape-analyzed to the heap), `gorun` allocates fixed virtual-memory stacks
- * that never move during the routine's lifetime. Taking pointers/references to stack variables across
- * suspension points (`yield`, `Channel::recv`, `Mutex::lock`) is 100% safe.
+ * Guarantees the **Stack Stability** invariant: fixed virtual-memory stacks never move during a routine's
+ * lifetime, so pointers/references to stack variables remain 100% valid across suspension points.
  */
 struct StackAllocation {
     void* base_allocation{nullptr}; ///< Base address returned by `VirtualAlloc` / `mmap` (starts with the Guard Page)
     std::size_t total_bytes{0};     ///< Total virtual memory region size in bytes (usable stack + guard page)
     void* stack_bottom{nullptr};    ///< Lowest usable stack address (immediately above the guard page)
-    void* stack_top{nullptr};       ///< Highest usable stack address (initial `RSP`; stack grows downward)
+    void* stack_top{nullptr};       ///< Highest usable stack address (initial `SP`; stack grows downward)
     std::size_t usable_bytes{0};    ///< Usable stack capacity in bytes
 };
 
 /**
  * @class StackPool
- * @brief Thread-safe recycling pool of routine stacks (`StackAllocation`).
+ * @brief Thread-safe multi-bucket recycling pool of routine stacks (`StackAllocation`).
  *
- * Avoids expensive `VirtualAlloc`/`VirtualFree` or `mmap`/`munmap` system calls on every `gorun::go(...)` spawn
- * by caching completed routine stacks in LIFO order.
+ * Maintains 8 power-of-two size-class buckets (16 KB, 32 KB, 64 KB, 128 KB, 256 KB, 512 KB, 1 MB, 2 MB)
+ * so applications mixing lightweight 16 KB routines and deep 512 KB routines both enjoy zero-syscall LIFO reuse.
  */
 class StackPool {
-    static constexpr std::size_t kMinStackBytes = 16 * 1024; ///< Minimum safe usable stack size (16 KB)
+    static constexpr std::size_t kMinStackBytes = 16 * 1024;
+    static constexpr std::size_t kBucketCount = 8;
+    static constexpr std::array<std::size_t, kBucketCount> kBucketSizes = {
+        16 * 1024,
+        32 * 1024,
+        64 * 1024,
+        128 * 1024,
+        256 * 1024,
+        512 * 1024,
+        1024 * 1024,
+        2048 * 1024
+    };
 
     std::size_t default_usable_size_;
     std::size_t max_pooled_;
     mutable std::mutex mutex_;
-    std::vector<StackAllocation> pool_;
+    std::array<std::vector<StackAllocation>, kBucketCount> buckets_{};
+    std::size_t pooled_total_{0};
+    std::size_t pooled_bytes_{0};
+    std::atomic<std::uint64_t> total_allocated_{0};
+    std::atomic<std::uint64_t> total_reused_{0};
 
-    /**
-     * @brief Queries the operating system virtual memory page size (typically 4096 bytes).
-     */
     static std::size_t page_size() noexcept {
 #if defined(_WIN32)
         SYSTEM_INFO si;
@@ -299,11 +347,16 @@ class StackPool {
         return (size + alignment - 1) & ~(alignment - 1);
     }
 
-    /**
-     * @brief Allocates a fresh stack from OS virtual memory and marks the lowest page as `PAGE_NOACCESS` / `PROT_NONE`.
-     * @param requested_usable Requested usable stack size in bytes (clamped to >= 16 KB, overflow-checked).
-     * @throws std::bad_alloc If OS virtual memory allocation fails or size overflows.
-     */
+    /// Maps a usable size to its bucket index, or `kBucketCount` if larger than 2 MB.
+    static std::size_t bucket_index_for(std::size_t usable_bytes) noexcept {
+        for (std::size_t i = 0; i < kBucketCount; ++i) {
+            if (usable_bytes <= kBucketSizes[i]) {
+                return i;
+            }
+        }
+        return kBucketCount;
+    }
+
     static StackAllocation os_allocate(std::size_t requested_usable) {
         const std::size_t pg = page_size();
         const std::size_t clamped = std::max(requested_usable, kMinStackBytes);
@@ -353,75 +406,112 @@ class StackPool {
     }
 
 public:
-    /**
-     * @brief Constructs a `StackPool`.
-     * @param default_usable_size Default usable stack size per routine in bytes (default: 128 KB, minimum 16 KB).
-     * @param max_pooled Maximum number of idle stacks retained in the pool before returning memory to the OS.
-     */
     explicit StackPool(std::size_t default_usable_size = 128 * 1024, std::size_t max_pooled = 1024)
-        : default_usable_size_(std::max(default_usable_size, kMinStackBytes))
+        : default_usable_size_(normalize_size(default_usable_size))
         , max_pooled_(max_pooled) {}
 
     ~StackPool() {
         std::lock_guard lock(mutex_);
-        for (const auto& s : pool_) {
-            os_deallocate(s);
+        for (auto& bucket : buckets_) {
+            for (const auto& s : bucket) {
+                os_deallocate(s);
+            }
+            bucket.clear();
         }
-        pool_.clear();
+        pooled_total_ = 0;
+        pooled_bytes_ = 0;
+    }
+
+    /// Normalizes a requested stack size into its rounded bucket size (or page-aligned custom size if > 2 MB).
+    [[nodiscard]] static std::size_t normalize_size(std::size_t requested) noexcept {
+        const std::size_t clamped = std::max(requested, kMinStackBytes);
+        const std::size_t idx = bucket_index_for(clamped);
+        if (idx < kBucketCount) {
+            return kBucketSizes[idx];
+        }
+        return align_up(clamped, page_size());
+    }
+
+    [[nodiscard]] std::size_t default_usable_size() const noexcept {
+        return default_usable_size_;
     }
 
     /**
-     * @brief Acquires a warm stack from the pool (LIFO) or allocates a new one from the OS.
-     * @return `StackAllocation` descriptor.
+     * @brief Acquires a warm stack matching `requested_bytes` (0 = default size) from the matching bucket,
+     *        or allocates a fresh guard-paged virtual-memory stack from the OS.
      */
-    StackAllocation acquire() {
-        {
+    StackAllocation acquire(std::size_t requested_bytes = 0) {
+        const std::size_t target = (requested_bytes == 0)
+            ? default_usable_size_
+            : normalize_size(requested_bytes);
+        const std::size_t idx = bucket_index_for(target);
+
+        if (idx < kBucketCount) {
             std::lock_guard lock(mutex_);
-            if (!pool_.empty()) {
-                StackAllocation s = pool_.back();
-                pool_.pop_back();
+            auto& bucket = buckets_[idx];
+            if (!bucket.empty()) {
+                StackAllocation s = bucket.back();
+                bucket.pop_back();
+                --pooled_total_;
+                pooled_bytes_ -= s.usable_bytes;
+                total_reused_.fetch_add(1, std::memory_order_relaxed);
                 return s;
             }
         }
-        return os_allocate(default_usable_size_);
+
+        StackAllocation alloc = os_allocate(target);
+        total_allocated_.fetch_add(1, std::memory_order_relaxed);
+        return alloc;
     }
 
     /**
-     * @brief Returns a finished routine's stack to the recycling pool.
-     * @param s Stack allocation descriptor to recycle.
+     * @brief Returns a finished routine's stack to its size-class bucket (or releases to OS if full/oversized).
      */
     void release(StackAllocation s) noexcept {
         if (!s.base_allocation) return;
-        {
+        const std::size_t idx = bucket_index_for(s.usable_bytes);
+        if (idx < kBucketCount && s.usable_bytes == kBucketSizes[idx]) {
             std::lock_guard lock(mutex_);
-            if (pool_.size() < max_pooled_) {
-                pool_.push_back(s);
+            if (pooled_total_ < max_pooled_) {
+                buckets_[idx].push_back(s);
+                ++pooled_total_;
+                pooled_bytes_ += s.usable_bytes;
                 return;
             }
         }
         os_deallocate(s);
     }
 
-    /**
-     * @brief Returns the current number of cached idle stacks in the pool.
-     */
     [[nodiscard]] std::size_t pooled_count() const noexcept {
         std::lock_guard lock(mutex_);
-        return pool_.size();
+        return pooled_total_;
+    }
+
+    [[nodiscard]] StackPoolStats stats() const noexcept {
+        std::lock_guard lock(mutex_);
+        return StackPoolStats{
+            .pooled_stacks = pooled_total_,
+            .pooled_bytes = pooled_bytes_,
+            .total_allocated = total_allocated_.load(std::memory_order_relaxed),
+            .total_reused = total_reused_.load(std::memory_order_relaxed)
+        };
     }
 };
 
-} // namespace gorun::detail
+} // namespace detail
+} // namespace gorun
 // ---- end gorun/detail/stack_pool.hpp ----
 // ---- begin gorun/detail/context.hpp ----
 
 /**
  * @file context.hpp
- * @brief Ultra-fast user-space CPU execution context (`ExecutionContext`) and assembly stack switching.
+ * @brief Ultra-fast user-space CPU execution context (`ExecutionContext`) and assembly stack switching
+ *        for x86_64 (Windows x64 ABI & System V AMD64 ABI) and ARM64 / AArch64 (AAPCS64: Linux ARM64,
+ *        Apple Silicon macOS M1-M4, Windows ARM64).
  *
  * Supports cross-thread migration of green routines across M:N OS worker threads (Work-Stealing)
- * on both Windows x64 ABI (saving GPRs, XMM6–XMM15, MXCSR, x87 FCW, and `NT_TIB` stack limits)
- * and System V AMD64 ABI (Linux/macOS, saving GPRs, MXCSR, and x87 FCW).
+ * with full callee-saved GPR, SIMD/FP, FPU control word / FPCR, and Windows `NT_TIB` stack-bound preservation,
+ * plus ASan/TSan no-sanitize annotations on the raw register swap boundary.
  */
 
 #include <atomic>
@@ -429,14 +519,42 @@ public:
 #include <cstdint>
 
 
-namespace gorun::detail {
+// Compiler-portable sanitizer suppression macros for raw stack-switching boundaries
+#if defined(__clang__)
+#define GORUN_NO_SANITIZE_FIBER __attribute__((no_sanitize("address", "thread")))
+#elif defined(__GNUC__)
+#define GORUN_NO_SANITIZE_FIBER __attribute__((no_sanitize_address))
+#else
+#define GORUN_NO_SANITIZE_FIBER
+#endif
 
-#if defined(_MSC_VER) && !defined(__clang__)
-#error "gorun requires a GNU/Clang inline-assembly compatible compiler (GCC, Clang, or MinGW-w64) on x86_64."
-#elif defined(__x86_64__) || defined(_M_X64)
+// Apple Mach-O prefixes C external symbols with a leading underscore
+#if defined(__APPLE__)
+#define GORUN_ASM_SYM(name) "_" #name
+#define GORUN_ASM_TYPE_FUNC(name)
+#else
+#define GORUN_ASM_SYM(name) #name
+#if defined(_WIN32)
+#define GORUN_ASM_TYPE_FUNC(name)
+#else
+#define GORUN_ASM_TYPE_FUNC(name) ".type " #name ", @function\n"
+#endif
+#endif
+
+namespace gorun::detail {
 
 extern "C" void gorun_context_switch_asm(void** from_rsp, void** to_rsp) noexcept;
 extern "C" void gorun_routine_entry_asm() noexcept;
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#error "gorun requires a GNU/Clang inline-assembly compatible compiler (GCC, Clang, or MinGW-w64)."
+
+// ============================================================================
+// Architecture 1: x86_64 (Windows x64 ABI + System V AMD64 ABI on Linux/macOS)
+// ============================================================================
+#elif defined(__x86_64__) || defined(_M_X64)
+
+inline constexpr const char* kArchitectureName = "x86_64";
 
 // Default IEEE-754 MXCSR (0x1F80: all SSE exceptions masked, round-to-nearest)
 // combined with default x87 FPU control word (0x037F: all x87 exceptions masked, 64-bit precision)
@@ -521,9 +639,9 @@ __asm__(
 #else
 __asm__(
     ".text\n"
-    ".globl gorun_context_switch_asm\n"
-    ".type gorun_context_switch_asm, @function\n"
-    "gorun_context_switch_asm:\n"
+    ".globl " GORUN_ASM_SYM(gorun_context_switch_asm) "\n"
+    GORUN_ASM_TYPE_FUNC(gorun_context_switch_asm)
+    GORUN_ASM_SYM(gorun_context_switch_asm) ":\n"
     "  .cfi_startproc\n"
     "  pushq %rbp\n"
     "  pushq %rbx\n"
@@ -547,9 +665,9 @@ __asm__(
     "  popq %rbp\n"
     "  retq\n"
     "  .cfi_endproc\n"
-    ".globl gorun_routine_entry_asm\n"
-    ".type gorun_routine_entry_asm, @function\n"
-    "gorun_routine_entry_asm:\n"
+    ".globl " GORUN_ASM_SYM(gorun_routine_entry_asm) "\n"
+    GORUN_ASM_TYPE_FUNC(gorun_routine_entry_asm)
+    GORUN_ASM_SYM(gorun_routine_entry_asm) ":\n"
     "  .cfi_startproc\n"
     "  subq $8, %rsp\n" // Align RSP so inside `callq *%r13`, RSP % 16 == 8 (System V AMD64 ABI)
     "  movq %r12, %rdi\n"
@@ -562,8 +680,6 @@ __asm__(
 /**
  * @struct ExecutionContext
  * @brief Hardware execution context for a green routine or worker scheduler loop (analogous to Go's `gobuf`).
- *
- * Stores the stack pointer `rsp` pointing to the saved register frame on the routine's isolated stack.
  */
 struct ExecutionContext {
     void* rsp{nullptr}; ///< Saved stack pointer (`%rsp`)
@@ -572,12 +688,6 @@ struct ExecutionContext {
     void cleanup_scheduler_for_current_thread() noexcept {}
     void destroy_routine_context() noexcept {}
 
-    /**
-     * @brief Initializes a fresh stack frame on `stack` so that the first `context_switch` jumps into `trampoline(arg)`.
-     * @param stack Allocated virtual memory stack region from `StackPool`.
-     * @param trampoline Entry-point function pointer (`Runtime::routine_trampoline`).
-     * @param arg Pointer to the owning `Routine` instance.
-     */
     void make_routine_stack_context(const StackAllocation& stack, void (*trampoline)(void*), void* arg) noexcept {
         auto top = reinterpret_cast<std::uintptr_t>(stack.stack_top);
         top &= ~static_cast<std::uintptr_t>(15);
@@ -614,18 +724,115 @@ struct ExecutionContext {
     }
 };
 
+// ============================================================================
+// Architecture 2: ARM64 / AArch64 (AAPCS64: Apple Silicon M1-M4, AWS Graviton, Linux ARM64)
+// ============================================================================
+#elif defined(__aarch64__) || defined(_M_ARM64)
+
+inline constexpr const char* kArchitectureName = "aarch64";
+
+// AAPCS64 callee-saved frame layout (176 bytes, 16-byte aligned):
+//   [sp +   0]: x19, x20   (x19 = arg, x20 = trampoline on initial entry)
+//   [sp +  16]: x21, x22
+//   [sp +  32]: x23, x24
+//   [sp +  48]: x25, x26
+//   [sp +  64]: x27, x28
+//   [sp +  80]: x29 (FP), x30 (LR)
+//   [sp +  96]: d8,  d9
+//   [sp + 112]: d10, d11
+//   [sp + 128]: d12, d13
+//   [sp + 144]: d14, d15
+//   [sp + 160]: fpcr, fpsr
+__asm__(
+    ".text\n"
+    ".p2align 2\n"
+    ".globl " GORUN_ASM_SYM(gorun_context_switch_asm) "\n"
+    GORUN_ASM_TYPE_FUNC(gorun_context_switch_asm)
+    GORUN_ASM_SYM(gorun_context_switch_asm) ":\n"
+    "  .cfi_startproc\n"
+    "  sub sp, sp, #176\n"
+    "  stp x19, x20, [sp, #0]\n"
+    "  stp x21, x22, [sp, #16]\n"
+    "  stp x23, x24, [sp, #32]\n"
+    "  stp x25, x26, [sp, #48]\n"
+    "  stp x27, x28, [sp, #64]\n"
+    "  stp x29, x30, [sp, #80]\n"
+    "  stp d8,  d9,  [sp, #96]\n"
+    "  stp d10, d11, [sp, #112]\n"
+    "  stp d12, d13, [sp, #128]\n"
+    "  stp d14, d15, [sp, #144]\n"
+    "  mrs x9,  fpcr\n"
+    "  mrs x10, fpsr\n"
+    "  stp x9,  x10, [sp, #160]\n"
+    // Switch SP: x0 = from_rsp, x1 = to_rsp
+    "  mov x9, sp\n"
+    "  str x9, [x0]\n"
+    "  ldr x9, [x1]\n"
+    "  mov sp, x9\n"
+    // Restore callee-saved FPCR/FPSR, SIMD d8-d15, and GPRs x19-x30
+    "  ldp x9,  x10, [sp, #160]\n"
+    "  msr fpcr, x9\n"
+    "  msr fpsr, x10\n"
+    "  ldp d14, d15, [sp, #144]\n"
+    "  ldp d12, d13, [sp, #128]\n"
+    "  ldp d10, d11, [sp, #112]\n"
+    "  ldp d8,  d9,  [sp, #96]\n"
+    "  ldp x29, x30, [sp, #80]\n"
+    "  ldp x27, x28, [sp, #64]\n"
+    "  ldp x25, x26, [sp, #48]\n"
+    "  ldp x23, x24, [sp, #32]\n"
+    "  ldp x21, x22, [sp, #16]\n"
+    "  ldp x19, x20, [sp, #0]\n"
+    "  add sp, sp, #176\n"
+    "  ret\n"
+    "  .cfi_endproc\n"
+    ".p2align 2\n"
+    ".globl " GORUN_ASM_SYM(gorun_routine_entry_asm) "\n"
+    GORUN_ASM_TYPE_FUNC(gorun_routine_entry_asm)
+    GORUN_ASM_SYM(gorun_routine_entry_asm) ":\n"
+    "  .cfi_startproc\n"
+    "  mov x0, x19\n"
+    "  blr x20\n"
+    "  brk #0\n"
+    "  .cfi_endproc\n"
+);
+
+struct ExecutionContext {
+    void* rsp{nullptr}; ///< Saved stack pointer (`sp`)
+
+    void init_scheduler_for_current_thread() noexcept {}
+    void cleanup_scheduler_for_current_thread() noexcept {}
+    void destroy_routine_context() noexcept {}
+
+    void make_routine_stack_context(const StackAllocation& stack, void (*trampoline)(void*), void* arg) noexcept {
+        auto top = reinterpret_cast<std::uintptr_t>(stack.stack_top);
+        top &= ~static_cast<std::uintptr_t>(15);
+
+        // Allocate 176-byte (22 x uint64_t) AAPCS64 frame matching gorun_context_switch_asm
+        auto* sp = reinterpret_cast<std::uint64_t*>(top) - 22;
+        for (int i = 0; i < 22; ++i) {
+            sp[i] = 0;
+        }
+        sp[0]  = reinterpret_cast<std::uint64_t>(arg);                      // x19 -> arg (x0 in entry)
+        sp[1]  = reinterpret_cast<std::uint64_t>(trampoline);               // x20 -> trampoline
+        sp[11] = reinterpret_cast<std::uint64_t>(&gorun_routine_entry_asm); // x30 (LR) -> return address for `ret`
+        rsp = sp;
+    }
+};
+
+#else
+#error "gorun: unsupported CPU architecture (x86_64 and ARM64/AArch64 are supported)."
+#endif
+
 /**
- * @brief Performs an ultra-fast (~10–15 ns) user-space context switch between `from` and `to`.
+ * @brief Performs an ultra-fast (~10-15 ns) user-space context switch between `from` and `to`.
  *
- * Marked `noinline` with compiler signal fences so optimizing compilers (`-O2`/`-O3`) never cache
- * `thread_local` pointers (`current_worker()`, `current_routine()`) in registers across a routine migration
- * between different OS worker threads.
- *
- * @param from Context where the current CPU registers and `%rsp` will be saved.
- * @param to Context whose CPU registers and `%rsp` will be restored.
+ * Marked `noinline` + no-sanitize with compiler signal fences so optimizing compilers (`-O2`/`-O3`)
+ * never cache `thread_local` pointers (`current_worker()`, `current_routine()`) in registers across
+ * a routine migration between different OS worker threads.
  */
 #if defined(__GNUC__) || defined(__clang__)
-__attribute__((noinline))
+__attribute__((noinline)) GORUN_NO_SANITIZE_FIBER
 #elif defined(_MSC_VER)
 __declspec(noinline)
 #endif
@@ -634,10 +841,6 @@ inline void context_switch(ExecutionContext* from, ExecutionContext* to) noexcep
     gorun_context_switch_asm(&from->rsp, &to->rsp);
     std::atomic_signal_fence(std::memory_order_seq_cst);
 }
-
-#else
-#error "gorun: unsupported CPU architecture (x86_64 is currently required)."
-#endif
 
 } // namespace gorun::detail
 // ---- end gorun/detail/context.hpp ----
@@ -1018,10 +1221,27 @@ struct DeferOperatorHelper {
 #endif
 #endif
 
+#if defined(__SANITIZE_THREAD__)
+#define GORUN_HAS_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define GORUN_HAS_TSAN 1
+#endif
+#endif
+
 #if defined(GORUN_HAS_ASAN)
 extern "C" {
 void __sanitizer_start_switch_fiber(void** fake_stack_save, const void* bottom, std::size_t size);
 void __sanitizer_finish_switch_fiber(void* fake_stack_save, const void** bottom_old, std::size_t* size_old);
+}
+#endif
+
+#if defined(GORUN_HAS_TSAN)
+extern "C" {
+void* __tsan_get_current_fiber(void);
+void* __tsan_create_fiber(unsigned flags);
+void  __tsan_destroy_fiber(void* fiber);
+void  __tsan_switch_to_fiber(void* fiber, unsigned flags);
 }
 #endif
 
@@ -1057,6 +1277,26 @@ struct Config {
      * @brief Maximum number of idle routine stacks cached in `StackPool` for zero-syscall reuse.
      */
     std::size_t max_pooled_stacks = 1024;
+};
+
+/**
+ * @struct RuntimeStats
+ * @brief Live scheduler introspection snapshot returned by `Runtime::stats()` (Prometheus/Grafana ready).
+ */
+struct RuntimeStats {
+    std::size_t worker_count{0};            ///< Total OS worker threads
+    std::size_t sleeping_workers{0};        ///< OS worker threads currently parked on idle CV
+    std::size_t active_routines{0};         ///< Unfinished routines (Ready + Running + Parked)
+    std::size_t parked_routines{0};         ///< Routines currently parked on Channel/Mutex/Timer/NetPoller
+    std::size_t running_routines{0};        ///< Routines actively executing on worker threads right now
+    std::size_t global_queue_size{0};       ///< Routines waiting in the Global Run Queue
+    std::vector<std::size_t> local_queue_sizes{}; ///< Per-worker local deque sizes
+    std::size_t total_local_queued{0};      ///< Sum of all per-worker local deque sizes
+    std::uint64_t total_spawned{0};         ///< Lifetime routines spawned on this Runtime
+    std::uint64_t total_completed{0};       ///< Lifetime routines completed on this Runtime
+    std::uint64_t total_steals{0};          ///< Lifetime successful work-stealing events across workers
+    std::size_t pending_timers{0};          ///< Currently armed timers in the timer wheel/map
+    StackPoolStats stack_pool{};            ///< Multi-bucket StackPool allocations, cache hits & cached bytes
 };
 
 namespace detail {
@@ -1243,6 +1483,18 @@ struct Routine {
 #if defined(GORUN_HAS_ASAN)
     void* asan_fake_stack{nullptr};
 #endif
+#if defined(GORUN_HAS_TSAN)
+    void* tsan_fiber{nullptr};
+#endif
+
+    ~Routine() noexcept {
+#if defined(GORUN_HAS_TSAN)
+        if (tsan_fiber) {
+            __tsan_destroy_fiber(tsan_fiber);
+            tsan_fiber = nullptr;
+        }
+#endif
+    }
 
     void clear_locals() noexcept {
         routine_locals.clear();
@@ -1375,6 +1627,11 @@ private:
     std::atomic<std::size_t> sleeping_workers_{0};
     std::atomic<std::uint32_t> waking_workers_{0};
     std::atomic<std::size_t> active_routines_{0};
+    std::atomic<std::size_t> parked_routines_{0};
+    std::atomic<std::size_t> running_routines_{0};
+    std::atomic<std::uint64_t> total_spawned_{0};
+    std::atomic<std::uint64_t> total_completed_{0};
+    std::atomic<std::uint64_t> total_steals_{0};
     std::atomic<bool> shutdown_{false};
 
     // Cancellable timer queue (O(log N) insert, O(1) earliest peek, O(log N) cancel with zero timer leaks!)
@@ -1398,7 +1655,7 @@ private:
 
     static void routine_trampoline(void* arg) noexcept;
 
-    detail::Routine* acquire_routine(detail::UniqueTask fn);
+    detail::Routine* acquire_routine(detail::UniqueTask fn, std::size_t requested_stack_size = 0);
     void release_routine(detail::Routine* r) noexcept;
     void timer_loop();
 
@@ -1443,27 +1700,43 @@ public:
     bool cancel_timer(std::uint64_t timer_id) noexcept;
 
     /**
-     * @brief Spawns a new green routine on this `Runtime` instance (supports move-only callables!).
+     * @brief Spawns a new green routine on this `Runtime` instance (supports move-only callables and custom stack sizes).
      * @tparam F Callable type `void()`.
      * @param fn Callable task body.
+     * @param stack_size Optional usable stack size in bytes (`0` = `Config::default_stack_size`).
      */
     template <typename F>
-    void spawn_raw(F&& fn) {
+    void spawn_raw(F&& fn, std::size_t stack_size = 0) {
         // Acquire routine BEFORE incrementing active_routines_ so std::bad_alloc never deadlocks wait_idle()!
-        detail::Routine* r = acquire_routine(detail::UniqueTask(std::forward<F>(fn)));
+        detail::Routine* r = acquire_routine(detail::UniqueTask(std::forward<F>(fn)), stack_size);
         r->implicit_scope = detail::current_implicit_scope();
         active_routines_.fetch_add(1, std::memory_order_relaxed);
+        total_spawned_.fetch_add(1, std::memory_order_relaxed);
         schedule(r);
     }
 
     /**
      * @brief Spawns a green routine on this `Runtime` instance.
-     * @tparam F Callable type `void()`.
-     * @param fn Callable task body.
      */
     template <typename F>
     void go(F&& fn) {
-        spawn_raw(std::forward<F>(fn));
+        spawn_raw(std::forward<F>(fn), 0);
+    }
+
+    /**
+     * @brief Spawns a green routine with a predefined `StackSize` (`Small`, `Compact`, `Default`, `Medium`, `Large`, `Huge`).
+     */
+    template <typename F>
+    void go(StackSize sz, F&& fn) {
+        spawn_raw(std::forward<F>(fn), static_cast<std::size_t>(sz));
+    }
+
+    /**
+     * @brief Spawns a green routine with explicit `Options` (e.g. `Options{.stack_size = 512 * 1024}`).
+     */
+    template <typename F>
+    void go(Options opts, F&& fn) {
+        spawn_raw(std::forward<F>(fn), opts.stack_size);
     }
 
     /**
@@ -1506,6 +1779,12 @@ public:
         std::lock_guard lock(timer_mutex_);
         return timer_index_.size();
     }
+
+    /**
+     * @brief Captures a live observability snapshot of scheduler queues, active/parked routines,
+     *        work-stealing steals, timers, and multi-bucket `StackPool` usage.
+     */
+    [[nodiscard]] RuntimeStats stats() noexcept;
 };
 
 /**
@@ -1547,6 +1826,9 @@ class Worker {
     const void* asan_scheduler_bottom_{nullptr};
     std::size_t asan_scheduler_size_{0};
 #endif
+#if defined(GORUN_HAS_TSAN)
+    void* tsan_scheduler_fiber_{nullptr};
+#endif
 
 public:
     Worker(Runtime& rt, std::size_t idx)
@@ -1558,6 +1840,7 @@ public:
     [[nodiscard]] std::size_t index() const noexcept { return index_; }
     [[nodiscard]] ExecutionContext& scheduler_context() noexcept { return scheduler_ctx_; }
     [[nodiscard]] std::vector<std::unique_ptr<Routine>>& local_free_routines() noexcept { return local_free_routines_; }
+    [[nodiscard]] std::size_t local_queue_size() const noexcept { return local_queue_.size(); }
 
 #if defined(GORUN_HAS_ASAN)
     void asan_before_switch_to_routine(Routine* r) noexcept {
@@ -1583,21 +1866,16 @@ public:
     }
 #endif
 
-    /**
-     * @brief Atomically transitions the current routine to `Parked`, switches CPU context to `scheduler_ctx_`,
-     *        and releases `primitive_lock` **after** the routine's registers are safely saved on its stack.
-     *
-     * @note Direct C++ equivalent of Go's `gopark(unlockf, lock)` in `runtime/proc.go`.
-     * Prevents both **Lost Wakeup** and **Premature Dual-Core Stack Execution**.
-     *
-     * @param primitive_lock Already-acquired spinlock of the synchronization primitive (`Channel`, `Mutex`, `WaitGroup`).
-     */
     void park_locked(SpinLock& primitive_lock) noexcept {
         Routine* r = current_routine_;
         r->state = RoutineState::Parked;
+        runtime_.parked_routines_.fetch_add(1, std::memory_order_relaxed);
         pending_unlock_ = &primitive_lock;
 #if defined(GORUN_HAS_ASAN)
         asan_before_switch_to_scheduler(r, false);
+#endif
+#if defined(GORUN_HAS_TSAN)
+        __tsan_switch_to_fiber(tsan_scheduler_fiber_, 0);
 #endif
         context_switch(&r->ctx, &scheduler_ctx_);
 #if defined(GORUN_HAS_ASAN)
@@ -1605,9 +1883,6 @@ public:
 #endif
     }
 
-    /**
-     * @brief Cooperatively yields execution back to the scheduler (`this_routine::yield()`), keeping the routine `Ready`.
-     */
     void yield_current() noexcept {
         Routine* r = current_routine_;
         r->state = RoutineState::Ready;
@@ -1615,21 +1890,24 @@ public:
 #if defined(GORUN_HAS_ASAN)
         asan_before_switch_to_scheduler(r, false);
 #endif
+#if defined(GORUN_HAS_TSAN)
+        __tsan_switch_to_fiber(tsan_scheduler_fiber_, 0);
+#endif
         context_switch(&r->ctx, &scheduler_ctx_);
 #if defined(GORUN_HAS_ASAN)
         current_worker()->asan_after_switch_to_routine(r);
 #endif
     }
 
-    /**
-     * @brief Marks the current routine as `Finished` and switches back to the worker scheduler loop for stack recycling.
-     */
     void finish_current() noexcept {
         Routine* r = current_routine_;
         r->state = RoutineState::Finished;
         finish_requested_ = true;
 #if defined(GORUN_HAS_ASAN)
         asan_before_switch_to_scheduler(r, false);
+#endif
+#if defined(GORUN_HAS_TSAN)
+        __tsan_switch_to_fiber(tsan_scheduler_fiber_, 0);
 #endif
         context_switch(&r->ctx, &scheduler_ctx_);
 #if defined(GORUN_HAS_ASAN)
@@ -1676,6 +1954,7 @@ public:
                 if (victim_idx == index_) continue;
                 Worker* victim = runtime_.workers_[victim_idx].get();
                 if (Routine* stolen = victim->local_queue_.steal_half_into(local_queue_)) {
+                    runtime_.total_steals_.fetch_add(1, std::memory_order_relaxed);
                     return stolen;
                 }
             }
@@ -1690,6 +1969,9 @@ public:
     void run_loop() {
         tls_current_worker() = this;
         scheduler_ctx_.init_scheduler_for_current_thread();
+#if defined(GORUN_HAS_TSAN)
+        tsan_scheduler_fiber_ = __tsan_get_current_fiber();
+#endif
 
         while (!runtime_.shutdown_.load(std::memory_order_acquire)) {
             Routine* r = find_runnable();
@@ -1737,15 +2019,20 @@ public:
             current_routine_ = r;
             tls_current_routine() = r;
             r->state = RoutineState::Running;
+            runtime_.running_routines_.fetch_add(1, std::memory_order_relaxed);
 
 #if defined(GORUN_HAS_ASAN)
             asan_before_switch_to_routine(r);
+#endif
+#if defined(GORUN_HAS_TSAN)
+            __tsan_switch_to_fiber(r->tsan_fiber, 0);
 #endif
             context_switch(&scheduler_ctx_, &r->ctx);
 #if defined(GORUN_HAS_ASAN)
             asan_after_switch_to_scheduler();
 #endif
 
+            runtime_.running_routines_.fetch_sub(1, std::memory_order_relaxed);
             current_routine_ = nullptr;
             tls_current_routine() = nullptr;
 
@@ -1761,6 +2048,7 @@ public:
             } else if (finish_requested_) {
                 finish_requested_ = false;
                 runtime_.release_routine(r);
+                runtime_.total_completed_.fetch_add(1, std::memory_order_relaxed);
                 if (runtime_.active_routines_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     std::lock_guard lk(runtime_.sleep_mutex_);
                     runtime_.sleep_cv_.notify_all();
@@ -1815,25 +2103,36 @@ inline void Runtime::routine_trampoline(void* arg) noexcept {
     }
 }
 
-inline detail::Routine* Runtime::acquire_routine(detail::UniqueTask fn) {
+inline detail::Routine* Runtime::acquire_routine(detail::UniqueTask fn, std::size_t requested_stack_size) {
+    const std::size_t default_usable = stack_pool_.default_usable_size();
+    const std::size_t target_usable = (requested_stack_size == 0)
+        ? default_usable
+        : detail::StackPool::normalize_size(requested_stack_size);
+    const bool is_default_size = (target_usable == default_usable);
+
     std::unique_ptr<detail::Routine> r;
-    detail::Worker* w = detail::current_worker();
-    if (w && &w->runtime() == this && !w->local_free_routines().empty()) {
-        r = std::move(w->local_free_routines().back());
-        w->local_free_routines().pop_back();
-    } else {
-        std::lock_guard lock(routine_pool_mutex_);
-        if (!routine_pool_.empty()) {
-            r = std::move(routine_pool_.back());
-            routine_pool_.pop_back();
+    if (is_default_size) {
+        detail::Worker* w = detail::current_worker();
+        if (w && &w->runtime() == this && !w->local_free_routines().empty()) {
+            r = std::move(w->local_free_routines().back());
+            w->local_free_routines().pop_back();
+        } else {
+            std::lock_guard lock(routine_pool_mutex_);
+            if (!routine_pool_.empty()) {
+                r = std::move(routine_pool_.back());
+                routine_pool_.pop_back();
+            }
         }
     }
 
     if (!r) {
         r = std::make_unique<detail::Routine>();
         r->owner_runtime = this;
-        r->stack = stack_pool_.acquire();
+        r->stack = stack_pool_.acquire(target_usable);
         r->ctx.make_routine_stack_context(r->stack, &Runtime::routine_trampoline, r.get());
+#if defined(GORUN_HAS_TSAN)
+        r->tsan_fiber = __tsan_create_fiber(0);
+#endif
     }
 
     r->id = next_routine_id_.fetch_add(1, std::memory_order_relaxed);
@@ -1846,18 +2145,22 @@ inline detail::Routine* Runtime::acquire_routine(detail::UniqueTask fn) {
 
 inline void Runtime::release_routine(detail::Routine* r) noexcept {
     std::unique_ptr<detail::Routine> ptr(r);
-    detail::Worker* w = detail::current_worker();
-    if (w && &w->runtime() == this && w->local_free_routines().size() < 64) {
-        w->local_free_routines().push_back(std::move(ptr));
-        return;
-    }
-    {
-        std::lock_guard lock(routine_pool_mutex_);
-        if (routine_pool_.size() < config_.max_pooled_stacks) {
-            routine_pool_.push_back(std::move(ptr));
+    const bool is_default_size = (ptr->stack.usable_bytes == stack_pool_.default_usable_size());
+    if (is_default_size) {
+        detail::Worker* w = detail::current_worker();
+        if (w && &w->runtime() == this && w->local_free_routines().size() < 64) {
+            w->local_free_routines().push_back(std::move(ptr));
             return;
         }
+        {
+            std::lock_guard lock(routine_pool_mutex_);
+            if (routine_pool_.size() < config_.max_pooled_stacks) {
+                routine_pool_.push_back(std::move(ptr));
+                return;
+            }
+        }
     }
+    // Custom-sized stacks return directly to their matching bucket in StackPool!
     stack_pool_.release(ptr->stack);
 }
 
@@ -1918,6 +2221,9 @@ inline Runtime::~Runtime() {
 }
 
 inline void Runtime::schedule(detail::Routine* r) noexcept {
+    if (r->state == detail::RoutineState::Parked) {
+        parked_routines_.fetch_sub(1, std::memory_order_relaxed);
+    }
     r->state = detail::RoutineState::Ready;
     bool pushed_to_global = false;
     bool should_wake = false;
@@ -2025,6 +2331,28 @@ inline void Runtime::wait_idle() noexcept {
     sleep_cv_.wait(lock, [this]() {
         return active_routines_.load(std::memory_order_acquire) == 0;
     });
+}
+
+inline RuntimeStats Runtime::stats() noexcept {
+    RuntimeStats s;
+    s.worker_count = config_.worker_count;
+    s.sleeping_workers = sleeping_workers_.load(std::memory_order_relaxed);
+    s.active_routines = active_routines_.load(std::memory_order_acquire);
+    s.parked_routines = parked_routines_.load(std::memory_order_relaxed);
+    s.running_routines = running_routines_.load(std::memory_order_relaxed);
+    s.global_queue_size = global_queue_.size();
+    s.local_queue_sizes.reserve(workers_.size());
+    for (const auto& w : workers_) {
+        std::size_t qsz = w->local_queue_size();
+        s.local_queue_sizes.push_back(qsz);
+        s.total_local_queued += qsz;
+    }
+    s.total_spawned = total_spawned_.load(std::memory_order_relaxed);
+    s.total_completed = total_completed_.load(std::memory_order_relaxed);
+    s.total_steals = total_steals_.load(std::memory_order_relaxed);
+    s.pending_timers = pending_timer_count();
+    s.stack_pool = stack_pool_.stats();
+    return s;
 }
 
 template <std::invocable F>
@@ -2153,6 +2481,16 @@ void sleep_for(std::chrono::duration<Rep, Period> duration) {
         return r->stop_source.get_token();
     }
     return std::stop_token{};
+}
+
+/**
+ * @brief Returns the usable virtual-memory stack size (in bytes) of the current green routine, or `0` on external OS threads.
+ */
+[[nodiscard]] inline std::size_t stack_size() noexcept {
+    if (detail::Routine* r = detail::current_routine()) {
+        return r->stack.usable_bytes;
+    }
+    return 0;
 }
 
 } // namespace this_routine
@@ -3804,6 +4142,10 @@ private:
 public:
     Context() : node_(std::make_shared<detail::ContextNode>(false)) {}
 
+    [[nodiscard]] bool can_cancel() const noexcept {
+        return node_ && node_->cancellable;
+    }
+
     [[nodiscard]] bool is_canceled() const noexcept {
         return node_->err_.load(std::memory_order_acquire) != ContextError::None;
     }
@@ -3962,6 +4304,7 @@ template <typename T>
  * @brief Structured concurrency (`TaskGroup`, `Scope`, `JoinHandle<T>`) and ergonomic `go(...)` launchers.
  */
 
+#include <atomic>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -3969,6 +4312,7 @@ template <typename T>
 #include <stop_token>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 
 
@@ -3978,6 +4322,7 @@ namespace gorun {
 /**
  * @class JoinHandle
  * @brief Handle to an asynchronously spawned green routine (non-OS-blocking equivalent of `std::future<T>`).
+ *        Supports synchronous `.get()`, non-blocking completion callbacks (used by C++20 `co_await`), and `.is_ready()`.
  */
 template <typename T>
 class JoinHandle {
@@ -3986,6 +4331,31 @@ public:
         WaitGroup wg{};
         std::optional<T> value{};
         std::exception_ptr exception{nullptr};
+        detail::SpinLock cb_lock{};
+        std::atomic<bool> ready{false};
+        std::vector<detail::UniqueTask> continuations{};
+
+        void mark_ready() noexcept {
+            std::vector<detail::UniqueTask> to_run;
+            {
+                std::lock_guard g(cb_lock);
+                ready.store(true, std::memory_order_release);
+                to_run.swap(continuations);
+            }
+            wg.done();
+            for (auto& cb : to_run) {
+                if (cb) cb();
+            }
+        }
+
+        bool add_continuation(detail::UniqueTask cb) {
+            std::lock_guard g(cb_lock);
+            if (ready.load(std::memory_order_acquire)) {
+                return false;
+            }
+            continuations.push_back(std::move(cb));
+            return true;
+        }
     };
 
 private:
@@ -3994,6 +4364,14 @@ private:
 public:
     explicit JoinHandle(std::shared_ptr<SharedState> s) noexcept
         : state_(std::move(s)) {}
+
+    [[nodiscard]] bool is_ready() const noexcept {
+        return state_ && state_->ready.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] const std::shared_ptr<SharedState>& shared_state() const noexcept {
+        return state_;
+    }
 
     T get() {
         state_->wg.wait();
@@ -4014,6 +4392,31 @@ public:
     struct SharedState {
         WaitGroup wg{};
         std::exception_ptr exception{nullptr};
+        detail::SpinLock cb_lock{};
+        std::atomic<bool> ready{false};
+        std::vector<detail::UniqueTask> continuations{};
+
+        void mark_ready() noexcept {
+            std::vector<detail::UniqueTask> to_run;
+            {
+                std::lock_guard g(cb_lock);
+                ready.store(true, std::memory_order_release);
+                to_run.swap(continuations);
+            }
+            wg.done();
+            for (auto& cb : to_run) {
+                if (cb) cb();
+            }
+        }
+
+        bool add_continuation(detail::UniqueTask cb) {
+            std::lock_guard g(cb_lock);
+            if (ready.load(std::memory_order_acquire)) {
+                return false;
+            }
+            continuations.push_back(std::move(cb));
+            return true;
+        }
     };
 
 private:
@@ -4022,6 +4425,14 @@ private:
 public:
     explicit JoinHandle(std::shared_ptr<SharedState> s) noexcept
         : state_(std::move(s)) {}
+
+    [[nodiscard]] bool is_ready() const noexcept {
+        return state_ && state_->ready.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] const std::shared_ptr<SharedState>& shared_state() const noexcept {
+        return state_;
+    }
 
     void get() {
         state_->wg.wait();
@@ -4073,7 +4484,7 @@ public:
     TaskGroup& operator=(const TaskGroup&) = delete;
 
     template <typename F>
-    void spawn(F&& fn) {
+    void spawn(F&& fn, std::size_t stack_size = 0) {
         wg_.add(1);
         try {
             runtime_.spawn_raw([this, f = std::forward<F>(fn)]() mutable {
@@ -4093,11 +4504,21 @@ public:
                 }
                 detail::set_implicit_scope(prev);
                 wg_.done();
-            });
+            }, stack_size);
         } catch (...) {
             wg_.done();
             throw;
         }
+    }
+
+    template <typename F>
+    void spawn(StackSize sz, F&& fn) {
+        spawn(std::forward<F>(fn), static_cast<std::size_t>(sz));
+    }
+
+    template <typename F>
+    void spawn(Options opts, F&& fn) {
+        spawn(std::forward<F>(fn), opts.stack_size);
     }
 
     void cancel() noexcept {
@@ -4144,8 +4565,36 @@ void go(F&& fn) {
 }
 
 template <typename F>
+void go(StackSize sz, F&& fn) {
+    if (TaskGroup* active_scope = detail::current_implicit_scope()) {
+        active_scope->spawn(sz, std::forward<F>(fn));
+    } else {
+        default_runtime().spawn_raw(std::forward<F>(fn), static_cast<std::size_t>(sz));
+    }
+}
+
+template <typename F>
+void go(Options opts, F&& fn) {
+    if (TaskGroup* active_scope = detail::current_implicit_scope()) {
+        active_scope->spawn(opts, std::forward<F>(fn));
+    } else {
+        default_runtime().spawn_raw(std::forward<F>(fn), opts.stack_size);
+    }
+}
+
+template <typename F>
 void go_in(TaskGroup& group, F&& fn) {
     group.spawn(std::forward<F>(fn));
+}
+
+template <typename F>
+void go_in(TaskGroup& group, StackSize sz, F&& fn) {
+    group.spawn(sz, std::forward<F>(fn));
+}
+
+template <typename F>
+void go_in(TaskGroup& group, Options opts, F&& fn) {
+    group.spawn(opts, std::forward<F>(fn));
 }
 
 template <typename F>
@@ -4153,8 +4602,18 @@ void go_in(Runtime& rt, F&& fn) {
     rt.spawn_raw(std::forward<F>(fn));
 }
 
+template <typename F>
+void go_in(Runtime& rt, StackSize sz, F&& fn) {
+    rt.spawn_raw(std::forward<F>(fn), static_cast<std::size_t>(sz));
+}
+
+template <typename F>
+void go_in(Runtime& rt, Options opts, F&& fn) {
+    rt.spawn_raw(std::forward<F>(fn), opts.stack_size);
+}
+
 template <std::invocable F>
-auto go_async(F&& fn) -> JoinHandle<std::invoke_result_t<F>> {
+auto go_async(Options opts, F&& fn) -> JoinHandle<std::invoke_result_t<F>> {
     using R = std::invoke_result_t<F>;
     using State = typename JoinHandle<R>::SharedState;
     auto state = std::make_shared<State>();
@@ -4171,16 +4630,1803 @@ auto go_async(F&& fn) -> JoinHandle<std::invoke_result_t<F>> {
             } catch (...) {
                 state->exception = std::current_exception();
             }
-            state->wg.done();
-        });
+            state->mark_ready();
+        }, opts.stack_size);
     } catch (...) {
-        state->wg.done();
+        state->mark_ready();
         throw;
     }
 
     return JoinHandle<R>(std::move(state));
 }
 
+template <std::invocable F>
+auto go_async(StackSize sz, F&& fn) -> JoinHandle<std::invoke_result_t<F>> {
+    return go_async(Options{.stack_size = static_cast<std::size_t>(sz)}, std::forward<F>(fn));
+}
+
+template <std::invocable F>
+auto go_async(F&& fn) -> JoinHandle<std::invoke_result_t<F>> {
+    return go_async(Options{}, std::forward<F>(fn));
+}
+
 } // namespace gorun
 // ---- end gorun/task_group.hpp ----
+// ---- begin gorun/blocking.hpp ----
+
+/**
+ * @file blocking.hpp
+ * @brief Elastic OS-thread blocking pool (`gorun::BlockingPool`, `gorun::spawn_blocking`) analogous to
+ *        `tokio::task::spawn_blocking`, plus non-blocking async file I/O helpers (`gorun::fs`).
+ *
+ * Offloads synchronous/blocking C libraries (SQLite, libpq, disk I/O, compression, crypto) onto
+ * an elastic pool of OS threads while keeping all `gorun` M:N green-thread workers 100% unblocked.
+ */
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <deque>
+#include <exception>
+#include <fstream>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+
+
+namespace gorun {
+
+/**
+ * @struct BlockingPoolConfig
+ * @brief Configuration for the elastic `gorun::BlockingPool`.
+ */
+struct BlockingPoolConfig {
+    std::size_t min_threads{2};                                  ///< Minimum warm OS threads kept alive
+    std::size_t max_threads{64};                                 ///< Upper cap on elastic OS threads
+    std::chrono::milliseconds idle_timeout{std::chrono::seconds(30)}; ///< Idle reclaim timeout for extra threads
+};
+
+/**
+ * @class BlockingPool
+ * @brief Elastic OS-thread pool for running blocking operations off `gorun`'s M:N scheduler workers.
+ */
+class BlockingPool {
+    BlockingPoolConfig cfg_;
+    mutable std::mutex mtx_;
+    std::condition_variable cv_;
+    std::deque<detail::UniqueTask> queue_;
+    std::size_t total_threads_{0};
+    std::size_t idle_threads_{0};
+    bool stopping_{false};
+    std::condition_variable exit_cv_;
+
+    void spawn_worker_locked() {
+        ++total_threads_;
+        std::thread([this]() { worker_loop(); }).detach();
+    }
+
+    void worker_loop() {
+        for (;;) {
+            detail::UniqueTask task;
+            {
+                std::unique_lock lk(mtx_);
+                ++idle_threads_;
+                const bool extra_thread = total_threads_ > cfg_.min_threads;
+                if (extra_thread) {
+                    cv_.wait_for(lk, cfg_.idle_timeout, [this]() {
+                        return stopping_ || !queue_.empty();
+                    });
+                } else {
+                    cv_.wait(lk, [this]() {
+                        return stopping_ || !queue_.empty();
+                    });
+                }
+                --idle_threads_;
+
+                if (queue_.empty()) {
+                    if (stopping_ || total_threads_ > cfg_.min_threads) {
+                        --total_threads_;
+                        if (total_threads_ == 0) {
+                            exit_cv_.notify_all();
+                        }
+                        return;
+                    }
+                    continue;
+                }
+
+                task = std::move(queue_.front());
+                queue_.pop_front();
+            }
+
+            if (task) {
+                task();
+            }
+        }
+    }
+
+public:
+    explicit BlockingPool(BlockingPoolConfig cfg = {})
+        : cfg_(cfg) {
+        if (cfg_.max_threads == 0) cfg_.max_threads = 1;
+        if (cfg_.min_threads > cfg_.max_threads) cfg_.min_threads = cfg_.max_threads;
+    }
+
+    ~BlockingPool() {
+        shutdown();
+    }
+
+    BlockingPool(const BlockingPool&) = delete;
+    BlockingPool& operator=(const BlockingPool&) = delete;
+
+    void shutdown() noexcept {
+        std::unique_lock lk(mtx_);
+        if (stopping_) return;
+        stopping_ = true;
+        cv_.notify_all();
+        exit_cv_.wait(lk, [this]() { return total_threads_ == 0; });
+    }
+
+    [[nodiscard]] std::size_t thread_count() const noexcept {
+        std::lock_guard lk(mtx_);
+        return total_threads_;
+    }
+
+    [[nodiscard]] std::size_t queued_count() const noexcept {
+        std::lock_guard lk(mtx_);
+        return queue_.size();
+    }
+
+    /**
+     * @brief Submits a blocking callable `fn()` onto the elastic OS pool and returns a `JoinHandle<R>`.
+     *        Calling `.get()` or `co_await` on the returned handle parks the green routine (zero worker blocking!).
+     */
+    template <std::invocable F>
+    auto spawn(F&& fn) -> JoinHandle<std::invoke_result_t<F>> {
+        using R = std::invoke_result_t<F>;
+        using State = typename JoinHandle<R>::SharedState;
+        auto state = std::make_shared<State>();
+        state->wg.add(1);
+
+        detail::UniqueTask job([state, f = std::forward<F>(fn)]() mutable {
+            try {
+                if constexpr (std::is_void_v<R>) {
+                    std::invoke(f);
+                } else {
+                    state->value.emplace(std::invoke(f));
+                }
+            } catch (...) {
+                state->exception = std::current_exception();
+            }
+            state->mark_ready();
+        });
+
+        {
+            std::lock_guard lk(mtx_);
+            if (stopping_) {
+                state->exception = std::make_exception_ptr(std::runtime_error("BlockingPool is shutting down"));
+                state->mark_ready();
+                return JoinHandle<R>(std::move(state));
+            }
+            queue_.push_back(std::move(job));
+            if (idle_threads_ == 0 && total_threads_ < cfg_.max_threads) {
+                spawn_worker_locked();
+            }
+        }
+        cv_.notify_one();
+        return JoinHandle<R>(std::move(state));
+    }
+};
+
+/// Returns the lazy global elastic `BlockingPool` used by `gorun::spawn_blocking(...)` and `gorun::fs`.
+inline BlockingPool& default_blocking_pool() {
+    static BlockingPool pool{};
+    return pool;
+}
+
+/**
+ * @brief Executes a blocking callable `fn()` on the elastic `BlockingPool` and returns a `JoinHandle<R>`
+ *        (analogous to `tokio::task::spawn_blocking`).
+ */
+template <std::invocable F>
+[[nodiscard]] auto spawn_blocking(F&& fn) -> JoinHandle<std::invoke_result_t<F>> {
+    return default_blocking_pool().spawn(std::forward<F>(fn));
+}
+
+/**
+ * @namespace gorun::fs
+ * @brief Non-worker-blocking file I/O helpers built on `gorun::spawn_blocking` (parks calling green routine).
+ */
+namespace fs {
+
+/// Reads an entire file into a `std::string` without blocking any `gorun` M:N worker thread.
+inline std::string read_file(std::string path) {
+    return spawn_blocking([p = std::move(path)]() -> std::string {
+        std::ifstream ifs(p, std::ios::binary);
+        if (!ifs) {
+            throw std::runtime_error("gorun::fs::read_file failed to open: " + p);
+        }
+        std::ostringstream oss;
+        oss << ifs.rdbuf();
+        return oss.str();
+    }).get();
+}
+
+/// Writes `content` to `path` without blocking any `gorun` M:N worker thread.
+inline void write_file(std::string path, std::string content) {
+    spawn_blocking([p = std::move(path), data = std::move(content)]() {
+        std::ofstream ofs(p, std::ios::binary | std::ios::trunc);
+        if (!ofs) {
+            throw std::runtime_error("gorun::fs::write_file failed to open: " + p);
+        }
+        ofs.write(data.data(), static_cast<std::streamsize>(data.size()));
+        if (!ofs) {
+            throw std::runtime_error("gorun::fs::write_file failed writing: " + p);
+        }
+    }).get();
+}
+
+/// Appends `content` to `path` without blocking any `gorun` M:N worker thread.
+inline void append_file(std::string path, std::string content) {
+    spawn_blocking([p = std::move(path), data = std::move(content)]() {
+        std::ofstream ofs(p, std::ios::binary | std::ios::app);
+        if (!ofs) {
+            throw std::runtime_error("gorun::fs::append_file failed to open: " + p);
+        }
+        ofs.write(data.data(), static_cast<std::streamsize>(data.size()));
+        if (!ofs) {
+            throw std::runtime_error("gorun::fs::append_file failed appending: " + p);
+        }
+    }).get();
+}
+
+} // namespace fs
+} // namespace gorun
+// ---- end gorun/blocking.hpp ----
+// ---- begin gorun/coro.hpp ----
+
+/**
+ * @file coro.hpp
+ * @brief Bidirectional C++20 Coroutines (`co_await`) bridge for `gorun`:
+ *        1. `co_await JoinHandle<T>` & `co_await JoinHandle<void>` (suspends coroutine cleanly without blocking OS threads).
+ *        2. `co_await gorun::co_recv(ch)` & `co_await gorun::co_send(ch, val)` for awaiting `gorun::Channel<T>`.
+ *        3. `gorun::Task<T>` lightweight C++20 coroutine task type.
+ *        4. `gorun::await_coro(awaitable)` — parks a `gorun` green routine while awaiting ANY external C++20 `co_await`-able!
+ */
+
+#include <coroutine>
+#include <exception>
+#include <memory>
+#include <optional>
+#include <semaphore>
+#include <type_traits>
+#include <utility>
+
+
+
+
+
+namespace gorun {
+
+// ============================================================================
+// 1. C++20 Awaiter for `JoinHandle<T>` and `JoinHandle<void>`
+// ============================================================================
+
+template <typename T>
+struct JoinHandleAwaiter {
+    std::shared_ptr<typename JoinHandle<T>::SharedState> state;
+
+    [[nodiscard]] bool await_ready() const noexcept {
+        return !state || state->ready.load(std::memory_order_acquire);
+    }
+
+    bool await_suspend(std::coroutine_handle<> handle) const {
+        if (!state) return false;
+        // Resumes the suspended C++20 coroutine on the gorun runtime once the green routine finishes!
+        return state->add_continuation([handle]() mutable {
+            default_runtime().spawn_raw([handle]() mutable {
+                handle.resume();
+            });
+        });
+    }
+
+    T await_resume() {
+        if (state->exception) {
+            std::rethrow_exception(state->exception);
+        }
+        return std::move(*state->value);
+    }
+};
+
+template <>
+struct JoinHandleAwaiter<void> {
+    std::shared_ptr<JoinHandle<void>::SharedState> state;
+
+    [[nodiscard]] bool await_ready() const noexcept {
+        return !state || state->ready.load(std::memory_order_acquire);
+    }
+
+    bool await_suspend(std::coroutine_handle<> handle) const {
+        if (!state) return false;
+        return state->add_continuation([handle]() mutable {
+            default_runtime().spawn_raw([handle]() mutable {
+                handle.resume();
+            });
+        });
+    }
+
+    void await_resume() const {
+        if (state && state->exception) {
+            std::rethrow_exception(state->exception);
+        }
+    }
+};
+
+/// Enables `auto val = co_await gorun::go_async(...);` and `co_await gorun::spawn_blocking(...);`!
+template <typename T>
+inline JoinHandleAwaiter<T> operator co_await(const JoinHandle<T>& handle) noexcept {
+    return JoinHandleAwaiter<T>{handle.shared_state()};
+}
+
+template <typename T>
+inline JoinHandleAwaiter<T> operator co_await(JoinHandle<T>&& handle) noexcept {
+    return JoinHandleAwaiter<T>{handle.shared_state()};
+}
+
+// ============================================================================
+// 2. C++20 Awaitables for `gorun::Channel<T>` (`co_recv` / `co_send`)
+// ============================================================================
+
+template <typename T>
+struct ChannelRecvAwaiter {
+    Channel<T>* ch;
+    std::optional<T> result{};
+
+    [[nodiscard]] bool await_ready() {
+        bool closed_empty = false;
+        if (ch->try_recv(result, closed_empty)) {
+            return true;
+        }
+        if (closed_empty) {
+            result.reset();
+            return true;
+        }
+        return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> handle) {
+        // Offload the parking channel recv onto a lightweight green routine (zero OS-thread blocking!)
+        default_runtime().spawn_raw([this, handle]() mutable {
+            result = ch->recv();
+            handle.resume();
+        }, static_cast<std::size_t>(StackSize::Small));
+    }
+
+    std::optional<T> await_resume() noexcept(std::is_nothrow_move_constructible_v<T>) {
+        return std::move(result);
+    }
+};
+
+template <typename T>
+struct ChannelSendAwaiter {
+    Channel<T>* ch;
+    T value;
+    bool ok{false};
+
+    [[nodiscard]] bool await_ready() {
+        bool closed = false;
+        if (ch->try_send(value, closed)) {
+            ok = true;
+            return true;
+        }
+        if (closed) {
+            ok = false;
+            return true;
+        }
+        return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> handle) {
+        default_runtime().spawn_raw([this, handle]() mutable {
+            ok = ch->send(std::move(value));
+            handle.resume();
+        }, static_cast<std::size_t>(StackSize::Small));
+    }
+
+    bool await_resume() const noexcept {
+        return ok;
+    }
+};
+
+/// C++20 awaitable for non-blocking receive from a `gorun::Channel<T>`: `auto v = co_await gorun::co_recv(ch);`
+template <typename T>
+[[nodiscard]] inline ChannelRecvAwaiter<T> co_recv(Channel<T>& ch) noexcept {
+    return ChannelRecvAwaiter<T>{&ch, std::nullopt};
+}
+
+/// C++20 awaitable for non-blocking send to a `gorun::Channel<T>`: `bool ok = co_await gorun::co_send(ch, val);`
+template <typename T>
+[[nodiscard]] inline ChannelSendAwaiter<T> co_send(Channel<T>& ch, T value) {
+    return ChannelSendAwaiter<T>{&ch, std::move(value), false};
+}
+
+// ============================================================================
+// 3. Lightweight Standard C++20 `gorun::Task<T>` Coroutine Type
+// ============================================================================
+
+template <typename T = void>
+class Task {
+public:
+    struct promise_type {
+        std::optional<T> value{};
+        std::exception_ptr exception{nullptr};
+        std::coroutine_handle<> continuation{};
+
+        Task get_return_object() noexcept {
+            return Task{std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+        std::suspend_always initial_suspend() noexcept { return {}; }
+
+        struct FinalAwaiter {
+            bool await_ready() const noexcept { return false; }
+            std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept {
+                if (h.promise().continuation) {
+                    return h.promise().continuation;
+                }
+                return std::noop_coroutine();
+            }
+            void await_resume() const noexcept {}
+        };
+        FinalAwaiter final_suspend() noexcept { return {}; }
+
+        void return_value(T v) { value.emplace(std::move(v)); }
+        void unhandled_exception() noexcept { exception = std::current_exception(); }
+    };
+
+private:
+    std::coroutine_handle<promise_type> handle_{};
+
+public:
+    explicit Task(std::coroutine_handle<promise_type> h) noexcept : handle_(h) {}
+    Task(Task&& other) noexcept : handle_(std::exchange(other.handle_, {})) {}
+    Task& operator=(Task&& other) noexcept {
+        if (this != &other) {
+            if (handle_) handle_.destroy();
+            handle_ = std::exchange(other.handle_, {});
+        }
+        return *this;
+    }
+    Task(const Task&) = delete;
+    Task& operator=(const Task&) = delete;
+
+    ~Task() {
+        if (handle_) handle_.destroy();
+    }
+
+    struct Awaiter {
+        std::coroutine_handle<promise_type> handle;
+
+        bool await_ready() const noexcept { return !handle || handle.done(); }
+        std::coroutine_handle<> await_suspend(std::coroutine_handle<> caller) noexcept {
+            handle.promise().continuation = caller;
+            return handle; // Symmetric transfer directly into child coroutine!
+        }
+        T await_resume() {
+            if (handle.promise().exception) {
+                std::rethrow_exception(handle.promise().exception);
+            }
+            return std::move(*handle.promise().value);
+        }
+    };
+
+    Awaiter operator co_await() && noexcept { return Awaiter{handle_}; }
+    Awaiter operator co_await() & noexcept { return Awaiter{handle_}; }
+};
+
+template <>
+class Task<void> {
+public:
+    struct promise_type {
+        std::exception_ptr exception{nullptr};
+        std::coroutine_handle<> continuation{};
+
+        Task get_return_object() noexcept {
+            return Task{std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+        std::suspend_always initial_suspend() noexcept { return {}; }
+
+        struct FinalAwaiter {
+            bool await_ready() const noexcept { return false; }
+            std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept {
+                if (h.promise().continuation) {
+                    return h.promise().continuation;
+                }
+                return std::noop_coroutine();
+            }
+            void await_resume() const noexcept {}
+        };
+        FinalAwaiter final_suspend() noexcept { return {}; }
+
+        void return_void() noexcept {}
+        void unhandled_exception() noexcept { exception = std::current_exception(); }
+    };
+
+private:
+    std::coroutine_handle<promise_type> handle_{};
+
+public:
+    explicit Task(std::coroutine_handle<promise_type> h) noexcept : handle_(h) {}
+    Task(Task&& other) noexcept : handle_(std::exchange(other.handle_, {})) {}
+    Task& operator=(Task&& other) noexcept {
+        if (this != &other) {
+            if (handle_) handle_.destroy();
+            handle_ = std::exchange(other.handle_, {});
+        }
+        return *this;
+    }
+    Task(const Task&) = delete;
+    Task& operator=(const Task&) = delete;
+
+    ~Task() {
+        if (handle_) handle_.destroy();
+    }
+
+    struct Awaiter {
+        std::coroutine_handle<promise_type> handle;
+
+        bool await_ready() const noexcept { return !handle || handle.done(); }
+        std::coroutine_handle<> await_suspend(std::coroutine_handle<> caller) noexcept {
+            handle.promise().continuation = caller;
+            return handle;
+        }
+        void await_resume() const {
+            if (handle.promise().exception) {
+                std::rethrow_exception(handle.promise().exception);
+            }
+        }
+    };
+
+    Awaiter operator co_await() && noexcept { return Awaiter{handle_}; }
+    Awaiter operator co_await() & noexcept { return Awaiter{handle_}; }
+};
+
+// ============================================================================
+// 4. Bridge: Await ANY C++20 `co_await`-able Inside a `gorun` Green Routine!
+// ============================================================================
+namespace detail {
+
+struct CoroSyncSignal {
+    SpinLock lock{};
+    bool done{false};
+    UniversalWaiter* waiter{nullptr};
+
+    void signal() noexcept {
+        lock.lock();
+        done = true;
+        UniversalWaiter* w = waiter;
+        lock.unlock();
+        if (w) {
+            w->unpark();
+        }
+    }
+
+    void wait() noexcept {
+        lock.lock();
+        if (!done) {
+            std::binary_semaphore sem{0};
+            auto w = UniversalWaiter::make_for_current(sem);
+            waiter = &w;
+            w.park_current(lock);
+        } else {
+            lock.unlock();
+        }
+    }
+};
+
+struct DetachedCoroDriver {
+    struct promise_type {
+        DetachedCoroDriver get_return_object() noexcept { return {}; }
+        std::suspend_never initial_suspend() noexcept { return {}; }
+        std::suspend_never final_suspend() noexcept { return {}; }
+        void return_void() noexcept {}
+        void unhandled_exception() noexcept {}
+    };
+};
+
+template <typename Awaitable>
+auto get_awaiter(Awaitable&& aw) {
+    if constexpr (requires { std::forward<Awaitable>(aw).operator co_await(); }) {
+        return std::forward<Awaitable>(aw).operator co_await();
+    } else if constexpr (requires { operator co_await(std::forward<Awaitable>(aw)); }) {
+        return operator co_await(std::forward<Awaitable>(aw));
+    } else {
+        return std::forward<Awaitable>(aw);
+    }
+}
+
+template <typename Awaitable>
+using AwaitResultT = decltype(get_awaiter(std::declval<Awaitable>()).await_resume());
+
+template <typename Awaitable, typename R>
+DetachedCoroDriver drive_awaitable_value(Awaitable aw,
+                                         std::optional<R>& out_val,
+                                         std::exception_ptr& out_exc,
+                                         CoroSyncSignal& sig) {
+    try {
+        out_val.emplace(co_await std::move(aw));
+    } catch (...) {
+        out_exc = std::current_exception();
+    }
+    sig.signal();
+}
+
+template <typename Awaitable>
+DetachedCoroDriver drive_awaitable_void(Awaitable aw,
+                                        std::exception_ptr& out_exc,
+                                        CoroSyncSignal& sig) {
+    try {
+        co_await std::move(aw);
+    } catch (...) {
+        out_exc = std::current_exception();
+    }
+    sig.signal();
+}
+
+} // namespace detail
+
+/**
+ * @brief Awaits ANY C++20 `co_await`-able (e.g., `gorun::Task<T>` or external coroutine library task)
+ *        synchronously inside a `gorun` green routine — parking the green routine without blocking OS workers!
+ */
+template <typename Awaitable>
+auto await_coro(Awaitable&& aw) -> detail::AwaitResultT<Awaitable> {
+    using R = detail::AwaitResultT<Awaitable>;
+    detail::CoroSyncSignal sig;
+    std::exception_ptr exc{nullptr};
+
+    if constexpr (std::is_void_v<R>) {
+        detail::drive_awaitable_void(std::forward<Awaitable>(aw), exc, sig);
+        sig.wait();
+        if (exc) {
+            std::rethrow_exception(exc);
+        }
+    } else {
+        std::optional<R> result;
+        detail::drive_awaitable_value(std::forward<Awaitable>(aw), result, exc, sig);
+        sig.wait();
+        if (exc) {
+            std::rethrow_exception(exc);
+        }
+        return std::move(*result);
+    }
+}
+
+} // namespace gorun
+// ---- end gorun/coro.hpp ----
+#if !defined(GORUN_DISABLE_NET)
+// ---- begin gorun/net.hpp ----
+
+/**
+ * @file net.hpp
+ * @brief Zero-dependency native asynchronous Network I/O Poller (`gorun::net`) built directly on
+ *        Windows IOCP (`CreateIoCompletionPort`, `WSARecv`, `WSASend`, `AcceptEx`, `ConnectEx`),
+ *        Linux `epoll` (`EPOLLET | EPOLLONESHOT`), and macOS/BSD `kqueue` (`EV_ONESHOT`).
+ *
+ * Parks calling `gorun` green routines while sockets wait for network readiness or completion,
+ * leaving all M:N OS worker threads free to serve thousands of other connections. Fully integrated
+ * with `gorun::Context` cancellation and deadlines.
+ */
+
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <semaphore>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+
+
+
+
+
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mswsock.h>
+#else
+#include <arpa/inet.h>
+#include <cerrno>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#if defined(__linux__)
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#include <sys/event.h>
+#endif
+#endif
+
+namespace gorun::net {
+
+/**
+ * @struct IoResult
+ * @brief Result of an asynchronous socket read or write operation.
+ */
+struct IoResult {
+    std::ptrdiff_t bytes{0};
+    std::error_code ec{};
+
+    [[nodiscard]] bool ok() const noexcept { return !ec; }
+    [[nodiscard]] bool eof() const noexcept { return !ec && bytes == 0; }
+};
+
+namespace detail {
+
+#if defined(_WIN32)
+
+inline std::error_code win_error(DWORD code) noexcept {
+    if (code == 0) return {};
+    if (code == ERROR_OPERATION_ABORTED || code == WSA_OPERATION_ABORTED) {
+        return std::make_error_code(std::errc::operation_canceled);
+    }
+    if (code == WSAETIMEDOUT || code == WAIT_TIMEOUT) {
+        return std::make_error_code(std::errc::timed_out);
+    }
+    if (code == WSAECONNRESET || code == ERROR_NETNAME_DELETED) {
+        return std::make_error_code(std::errc::connection_reset);
+    }
+    if (code == WSAECONNREFUSED) {
+        return std::make_error_code(std::errc::connection_refused);
+    }
+    return std::error_code(static_cast<int>(code), std::system_category());
+}
+
+struct WsaRuntime {
+    WsaRuntime() {
+        WSADATA wsa{};
+        if (::WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            throw std::runtime_error("gorun::net: WSAStartup failed");
+        }
+    }
+    ~WsaRuntime() {
+        ::WSACleanup();
+    }
+};
+
+inline void ensure_wsa() {
+    static WsaRuntime wsa_singleton;
+    (void)wsa_singleton;
+}
+
+/// Overlapped IOCP operation state; self-retained until the kernel posts its completion packet.
+struct IocpOp {
+    OVERLAPPED ov{};
+    std::shared_ptr<IocpOp> self_ref{};
+
+    ::gorun::detail::SpinLock lock{};
+    bool completed{false};
+    DWORD bytes_transferred{0};
+    DWORD error_code{0};
+    ::gorun::detail::UniversalWaiter* waiter{nullptr};
+    std::shared_ptr<Channel<bool>> select_ch{};
+
+    void complete(DWORD bytes, DWORD err) noexcept {
+        ::gorun::detail::UniversalWaiter* w = nullptr;
+        std::shared_ptr<Channel<bool>> ch;
+        {
+            std::lock_guard g(lock);
+            bytes_transferred = bytes;
+            error_code = err;
+            completed = true;
+            w = waiter;
+            waiter = nullptr;
+            ch = select_ch;
+        }
+        if (w) {
+            w->unpark();
+        }
+        if (ch) {
+            bool v = true;
+            bool closed = false;
+            (void)ch->try_send(v, closed);
+        }
+    }
+
+    void wait_uninterruptible() noexcept {
+        lock.lock();
+        if (completed) {
+            lock.unlock();
+            return;
+        }
+        std::binary_semaphore sem{0};
+        auto w = ::gorun::detail::UniversalWaiter::make_for_current(sem);
+        waiter = &w;
+        w.park_current(lock);
+    }
+
+    /// Waits for IOCP completion or `ctx` cancellation; on cancel, calls `CancelIoEx` and drains the abort packet safely.
+    bool wait_with_context(SOCKET sock, const Context& ctx) {
+        if (!ctx.can_cancel()) {
+            wait_uninterruptible();
+            return false;
+        }
+
+        auto ch = std::make_shared<Channel<bool>>(1);
+        {
+            std::lock_guard g(lock);
+            if (completed) return false;
+            select_ch = ch;
+        }
+
+        bool canceled = false;
+        select(
+            ch->on_recv([&](bool) {}),
+            ctx.on_done([&]() { canceled = true; })
+        );
+
+        if (canceled) {
+            ::CancelIoEx(reinterpret_cast<HANDLE>(sock), &ov);
+            // Must wait for the kernel to finish aborting so caller's buffer is never touched after return!
+            wait_uninterruptible();
+            return true;
+        }
+        return false;
+    }
+};
+
+class IocpPoller {
+    static constexpr ULONG_PTR kShutdownKey = 0xDEADBEEFu;
+
+    HANDLE iocp_{nullptr};
+    std::jthread poller_thread_;
+    LPFN_ACCEPTEX accept_ex_{nullptr};
+    LPFN_CONNECTEX connect_ex_{nullptr};
+
+    void load_extension_fns() {
+        SOCKET tmp = ::WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
+        if (tmp == INVALID_SOCKET) {
+            throw std::runtime_error("gorun::net: failed to create probe socket for Winsock extensions");
+        }
+        DWORD bytes = 0;
+        GUID guid_accept = WSAID_ACCEPTEX;
+        ::WSAIoctl(tmp, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                   &guid_accept, sizeof(guid_accept),
+                   &accept_ex_, sizeof(accept_ex_), &bytes, nullptr, nullptr);
+
+        GUID guid_connect = WSAID_CONNECTEX;
+        ::WSAIoctl(tmp, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                   &guid_connect, sizeof(guid_connect),
+                   &connect_ex_, sizeof(connect_ex_), &bytes, nullptr, nullptr);
+        ::closesocket(tmp);
+    }
+
+    void poll_loop() {
+        for (;;) {
+            DWORD bytes = 0;
+            ULONG_PTR key = 0;
+            LPOVERLAPPED ov = nullptr;
+            BOOL ok = ::GetQueuedCompletionStatus(iocp_, &bytes, &key, &ov, INFINITE);
+
+            if (key == kShutdownKey && ov == nullptr) {
+                return;
+            }
+            if (!ov) {
+                continue;
+            }
+
+            DWORD err = ok ? 0 : ::GetLastError();
+            auto* op = reinterpret_cast<IocpOp*>(ov);
+            std::shared_ptr<IocpOp> keep_alive = std::move(op->self_ref);
+            op->complete(bytes, err);
+        }
+    }
+
+public:
+    IocpPoller() {
+        ensure_wsa();
+        iocp_ = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
+        if (!iocp_) {
+            throw std::runtime_error("gorun::net: CreateIoCompletionPort failed");
+        }
+        load_extension_fns();
+        poller_thread_ = std::jthread([this]() { poll_loop(); });
+    }
+
+    ~IocpPoller() {
+        if (iocp_) {
+            ::PostQueuedCompletionStatus(iocp_, 0, kShutdownKey, nullptr);
+            if (poller_thread_.joinable()) {
+                poller_thread_.join();
+            }
+            ::CloseHandle(iocp_);
+            iocp_ = nullptr;
+        }
+    }
+
+    bool associate(SOCKET s) const {
+        if (!::CreateIoCompletionPort(reinterpret_cast<HANDLE>(s), iocp_, 0, 0)) {
+            throw std::runtime_error("gorun::net: failed to associate socket with IOCP");
+        }
+        return ::SetFileCompletionNotificationModes(
+            reinterpret_cast<HANDLE>(s),
+            FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE
+        ) != 0;
+    }
+
+    [[nodiscard]] LPFN_ACCEPTEX accept_ex() const noexcept { return accept_ex_; }
+    [[nodiscard]] LPFN_CONNECTEX connect_ex() const noexcept { return connect_ex_; }
+
+    static IocpPoller& instance() {
+        static IocpPoller poller;
+        return poller;
+    }
+};
+
+#else // POSIX (Linux epoll / macOS & BSD kqueue)
+
+inline void set_nonblocking(int fd) {
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+}
+
+struct PollWaiter {
+    ::gorun::detail::SpinLock lock{};
+    bool ready{false};
+    ::gorun::detail::UniversalWaiter* waiter{nullptr};
+    std::shared_ptr<Channel<bool>> select_ch{};
+
+    void wake() noexcept {
+        ::gorun::detail::UniversalWaiter* w = nullptr;
+        std::shared_ptr<Channel<bool>> ch;
+        {
+            std::lock_guard g(lock);
+            ready = true;
+            w = waiter;
+            waiter = nullptr;
+            ch = select_ch;
+        }
+        if (w) w->unpark();
+        if (ch) {
+            bool v = true;
+            bool closed = false;
+            (void)ch->try_send(v, closed);
+        }
+    }
+
+    bool wait(const Context& ctx) {
+        if (!ctx.can_cancel()) {
+            lock.lock();
+            if (ready) {
+                lock.unlock();
+                return false;
+            }
+            std::binary_semaphore sem{0};
+            auto w = ::gorun::detail::UniversalWaiter::make_for_current(sem);
+            waiter = &w;
+            w.park_current(lock);
+            return false;
+        }
+
+        auto ch = std::make_shared<Channel<bool>>(1);
+        {
+            std::lock_guard g(lock);
+            if (ready) return false;
+            select_ch = ch;
+        }
+
+        bool canceled = false;
+        select(
+            ch->on_recv([&](bool) {}),
+            ctx.on_done([&]() { canceled = true; })
+        );
+        return canceled;
+    }
+};
+
+class PosixPoller {
+    int poll_fd_{-1};
+#if defined(__linux__)
+    int wake_fd_{-1};
+#endif
+    std::atomic<bool> stop_{false};
+    std::mutex map_mtx_;
+    struct FdWaiters {
+        std::shared_ptr<PollWaiter> read_w;
+        std::shared_ptr<PollWaiter> write_w;
+    };
+    std::unordered_map<int, FdWaiters> waiters_;
+    std::jthread poller_thread_;
+
+    void poll_loop() {
+#if defined(__linux__)
+        epoll_event events[128];
+        while (!stop_.load(std::memory_order_acquire)) {
+            int n = ::epoll_wait(poll_fd_, events, 128, -1);
+            if (n <= 0) continue;
+            for (int i = 0; i < n; ++i) {
+                int fd = events[i].data.fd;
+                if (fd == wake_fd_) {
+                    std::uint64_t val = 0;
+                    (void)::read(wake_fd_, &val, sizeof(val));
+                    continue;
+                }
+                const std::uint32_t ev = events[i].events;
+                std::shared_ptr<PollWaiter> rw;
+                std::shared_ptr<PollWaiter> ww;
+                {
+                    std::lock_guard lk(map_mtx_);
+                    auto it = waiters_.find(fd);
+                    if (it != waiters_.end()) {
+                        if (ev & (EPOLLIN | EPOLLERR | EPOLLHUP)) {
+                            rw = std::move(it->second.read_w);
+                        }
+                        if (ev & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
+                            ww = std::move(it->second.write_w);
+                        }
+                    }
+                }
+                if (rw) rw->wake();
+                if (ww) ww->wake();
+            }
+        }
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+        struct kevent events[128];
+        while (!stop_.load(std::memory_order_acquire)) {
+            int n = ::kevent(poll_fd_, nullptr, 0, events, 128, nullptr);
+            if (n <= 0) continue;
+            for (int i = 0; i < n; ++i) {
+                if (events[i].filter == EVFILT_USER) continue;
+                int fd = static_cast<int>(events[i].ident);
+                std::shared_ptr<PollWaiter> rw;
+                std::shared_ptr<PollWaiter> ww;
+                {
+                    std::lock_guard lk(map_mtx_);
+                    auto it = waiters_.find(fd);
+                    if (it != waiters_.end()) {
+                        if (events[i].filter == EVFILT_READ) rw = std::move(it->second.read_w);
+                        if (events[i].filter == EVFILT_WRITE) ww = std::move(it->second.write_w);
+                    }
+                }
+                if (rw) rw->wake();
+                if (ww) ww->wake();
+            }
+        }
+#endif
+    }
+
+public:
+    PosixPoller() {
+#if defined(__linux__)
+        poll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
+        wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (poll_fd_ < 0 || wake_fd_ < 0) {
+            throw std::runtime_error("gorun::net: epoll_create1/eventfd failed");
+        }
+        epoll_event ev{};
+        ev.events = EPOLLIN;
+        ev.data.fd = wake_fd_;
+        ::epoll_ctl(poll_fd_, EPOLL_CTL_ADD, wake_fd_, &ev);
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+        poll_fd_ = ::kqueue();
+        if (poll_fd_ < 0) {
+            throw std::runtime_error("gorun::net: kqueue() failed");
+        }
+        struct kevent kev{};
+        EV_SET(&kev, 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, nullptr);
+        ::kevent(poll_fd_, &kev, 1, nullptr, 0, nullptr);
+#endif
+        poller_thread_ = std::jthread([this]() { poll_loop(); });
+    }
+
+    ~PosixPoller() {
+        stop_.store(true, std::memory_order_release);
+#if defined(__linux__)
+        std::uint64_t one = 1;
+        (void)::write(wake_fd_, &one, sizeof(one));
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+        struct kevent kev{};
+        EV_SET(&kev, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
+        ::kevent(poll_fd_, &kev, 1, nullptr, 0, nullptr);
+#endif
+        if (poller_thread_.joinable()) {
+            poller_thread_.join();
+        }
+#if defined(__linux__)
+        if (wake_fd_ >= 0) ::close(wake_fd_);
+#endif
+        if (poll_fd_ >= 0) ::close(poll_fd_);
+    }
+
+    void unregister_fd(int fd) {
+        std::shared_ptr<PollWaiter> rw;
+        std::shared_ptr<PollWaiter> ww;
+        {
+            std::lock_guard lk(map_mtx_);
+            auto it = waiters_.find(fd);
+            if (it != waiters_.end()) {
+                rw = std::move(it->second.read_w);
+                ww = std::move(it->second.write_w);
+                waiters_.erase(it);
+            }
+        }
+#if defined(__linux__)
+        ::epoll_ctl(poll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+#endif
+        if (rw) rw->wake();
+        if (ww) ww->wake();
+    }
+
+    bool wait_ready(int fd, bool for_write, const Context& ctx) {
+        auto w = std::make_shared<PollWaiter>();
+        {
+            std::lock_guard lk(map_mtx_);
+            auto& slot = waiters_[fd];
+            if (for_write) slot.write_w = w;
+            else slot.read_w = w;
+
+#if defined(__linux__)
+            epoll_event ev{};
+            ev.data.fd = fd;
+            ev.events = EPOLLET | EPOLLONESHOT;
+            if (slot.read_w) ev.events |= EPOLLIN;
+            if (slot.write_w) ev.events |= EPOLLOUT;
+            if (::epoll_ctl(poll_fd_, EPOLL_CTL_MOD, fd, &ev) != 0 && errno == ENOENT) {
+                ::epoll_ctl(poll_fd_, EPOLL_CTL_ADD, fd, &ev);
+            }
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+            struct kevent kev{};
+            EV_SET(&kev, static_cast<uintptr_t>(fd),
+                   for_write ? EVFILT_WRITE : EVFILT_READ,
+                   EV_ADD | EV_ONESHOT, 0, 0, nullptr);
+            ::kevent(poll_fd_, &kev, 1, nullptr, 0, nullptr);
+#endif
+        }
+        bool canceled = w->wait(ctx);
+        if (canceled) {
+            std::lock_guard lk(map_mtx_);
+            auto it = waiters_.find(fd);
+            if (it != waiters_.end()) {
+                if (for_write && it->second.write_w == w) it->second.write_w.reset();
+                if (!for_write && it->second.read_w == w) it->second.read_w.reset();
+            }
+        }
+        return canceled;
+    }
+
+    static PosixPoller& instance() {
+        static PosixPoller poller;
+        return poller;
+    }
+};
+
+#endif
+
+} // namespace detail
+
+/**
+ * @class TcpStream
+ * @brief Non-blocking, green-routine-friendly TCP stream backed by IOCP (Windows), epoll (Linux), or kqueue (macOS).
+ */
+class TcpStream {
+#if defined(_WIN32)
+    SOCKET sock_{INVALID_SOCKET};
+    bool skip_iocp_on_sync_{false};
+#else
+    int sock_{-1};
+#endif
+    std::string peer_addr_{};
+
+    friend class TcpListener;
+
+#if defined(_WIN32)
+    TcpStream(SOCKET s, std::string peer, bool skip_sync = false) noexcept
+        : sock_(s), skip_iocp_on_sync_(skip_sync), peer_addr_(std::move(peer)) {}
+#else
+    TcpStream(int s, std::string peer) noexcept : sock_(s), peer_addr_(std::move(peer)) {}
+#endif
+
+public:
+    TcpStream() noexcept = default;
+
+    TcpStream(TcpStream&& other) noexcept
+        : sock_(std::exchange(other.sock_,
+#if defined(_WIN32)
+                              INVALID_SOCKET
+#else
+                              -1
+#endif
+                              ))
+#if defined(_WIN32)
+        , skip_iocp_on_sync_(std::exchange(other.skip_iocp_on_sync_, false))
+#endif
+        , peer_addr_(std::move(other.peer_addr_)) {}
+
+    TcpStream& operator=(TcpStream&& other) noexcept {
+        if (this != &other) {
+            close();
+            sock_ = std::exchange(other.sock_,
+#if defined(_WIN32)
+                                  INVALID_SOCKET
+#else
+                                  -1
+#endif
+            );
+#if defined(_WIN32)
+            skip_iocp_on_sync_ = std::exchange(other.skip_iocp_on_sync_, false);
+#endif
+            peer_addr_ = std::move(other.peer_addr_);
+        }
+        return *this;
+    }
+
+    TcpStream(const TcpStream&) = delete;
+    TcpStream& operator=(const TcpStream&) = delete;
+
+    ~TcpStream() {
+        close();
+    }
+
+    [[nodiscard]] bool is_open() const noexcept {
+#if defined(_WIN32)
+        return sock_ != INVALID_SOCKET;
+#else
+        return sock_ >= 0;
+#endif
+    }
+
+    [[nodiscard]] const std::string& peer_address() const noexcept { return peer_addr_; }
+
+    void set_nodelay(bool enable) noexcept {
+        if (!is_open()) return;
+        int flag = enable ? 1 : 0;
+#if defined(_WIN32)
+        ::setsockopt(sock_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&flag), sizeof(flag));
+#else
+        ::setsockopt(sock_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+#endif
+    }
+
+    void shutdown_write() noexcept {
+        if (!is_open()) return;
+#if defined(_WIN32)
+        ::shutdown(sock_, SD_SEND);
+#else
+        ::shutdown(sock_, SHUT_WR);
+#endif
+    }
+
+    void close() noexcept {
+        if (!is_open()) return;
+#if defined(_WIN32)
+        SOCKET s = std::exchange(sock_, INVALID_SOCKET);
+        ::CancelIoEx(reinterpret_cast<HANDLE>(s), nullptr);
+        ::closesocket(s);
+#else
+        int s = std::exchange(sock_, -1);
+        detail::PosixPoller::instance().unregister_fd(s);
+        ::close(s);
+#endif
+    }
+
+    /**
+     * @brief Establishes a non-blocking TCP connection to `host:port` without blocking M:N worker threads.
+     */
+    static TcpStream connect(std::string_view host, std::uint16_t port, Context ctx = background()) {
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        std::string host_str(host);
+        if (::inet_pton(AF_INET, host_str.c_str(), &addr.sin_addr) != 1) {
+            throw std::runtime_error("gorun::net::TcpStream::connect: invalid IPv4 address: " + host_str);
+        }
+
+#if defined(_WIN32)
+        auto& poller = detail::IocpPoller::instance();
+        SOCKET s = ::WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
+        if (s == INVALID_SOCKET) {
+            throw std::runtime_error("gorun::net::TcpStream::connect: WSASocket failed");
+        }
+        // ConnectEx requires the socket to be bound to an ephemeral local port first
+        sockaddr_in local{};
+        local.sin_family = AF_INET;
+        local.sin_addr.s_addr = INADDR_ANY;
+        local.sin_port = 0;
+        if (::bind(s, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) == SOCKET_ERROR) {
+            ::closesocket(s);
+            throw std::runtime_error("gorun::net::TcpStream::connect: bind failed");
+        }
+        bool skip_sync = poller.associate(s);
+
+        auto op = std::make_shared<detail::IocpOp>();
+        op->self_ref = op;
+        DWORD sent = 0;
+        BOOL ok = poller.connect_ex()(
+            s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr),
+            nullptr, 0, &sent, &op->ov
+        );
+        if (ok && skip_sync) {
+            op->self_ref.reset();
+        } else {
+            if (!ok) {
+                DWORD err = ::WSAGetLastError();
+                if (err != WSA_IO_PENDING) {
+                    op->self_ref.reset();
+                    ::closesocket(s);
+                    throw std::system_error(detail::win_error(err), "TcpStream::connect failed");
+                }
+            }
+            bool canceled = op->wait_with_context(s, ctx);
+            if (canceled || op->error_code != 0) {
+                ::closesocket(s);
+                throw std::system_error(
+                    canceled ? std::make_error_code(std::errc::operation_canceled) : detail::win_error(op->error_code),
+                    "TcpStream::connect failed"
+                );
+            }
+        }
+        ::setsockopt(s, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0);
+        TcpStream stream(s, host_str + ":" + std::to_string(port), skip_sync);
+        stream.set_nodelay(true);
+        return stream;
+#else
+        int s = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (s < 0) {
+            throw std::system_error(errno, std::generic_category(), "TcpStream::connect socket()");
+        }
+        detail::set_nonblocking(s);
+        int rc = ::connect(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+        if (rc < 0) {
+            if (errno != EINPROGRESS) {
+                int err = errno;
+                ::close(s);
+                throw std::system_error(err, std::generic_category(), "TcpStream::connect()");
+            }
+            bool canceled = detail::PosixPoller::instance().wait_ready(s, /*for_write=*/true, ctx);
+            if (canceled) {
+                detail::PosixPoller::instance().unregister_fd(s);
+                ::close(s);
+                throw std::system_error(std::make_error_code(std::errc::operation_canceled), "TcpStream::connect");
+            }
+            int so_err = 0;
+            socklen_t len = sizeof(so_err);
+            ::getsockopt(s, SOL_SOCKET, SO_ERROR, &so_err, &len);
+            if (so_err != 0) {
+                detail::PosixPoller::instance().unregister_fd(s);
+                ::close(s);
+                throw std::system_error(so_err, std::generic_category(), "TcpStream::connect");
+            }
+        }
+        TcpStream stream(s, host_str + ":" + std::to_string(port));
+        stream.set_nodelay(true);
+        return stream;
+#endif
+    }
+
+    /**
+     * @brief Reads up to `len` bytes into `buf`, parking the calling green routine until data arrives or `ctx` cancels.
+     */
+    IoResult read(void* buf, std::size_t len, Context ctx = background()) {
+        if (!is_open()) {
+            return IoResult{0, std::make_error_code(std::errc::bad_file_descriptor)};
+        }
+        if (ctx.is_canceled()) {
+            return IoResult{0, std::make_error_code(std::errc::operation_canceled)};
+        }
+
+#if defined(_WIN32)
+        auto op = std::make_shared<detail::IocpOp>();
+        op->self_ref = op;
+        WSABUF wbuf{};
+        wbuf.buf = static_cast<CHAR*>(buf);
+        wbuf.len = static_cast<ULONG>(len);
+        DWORD flags = 0;
+        DWORD recvd = 0;
+        int rc = ::WSARecv(sock_, &wbuf, 1, &recvd, &flags, &op->ov, nullptr);
+        if (rc == 0 && skip_iocp_on_sync_) {
+            op->self_ref.reset();
+            return IoResult{static_cast<std::ptrdiff_t>(recvd), {}};
+        }
+        if (rc == SOCKET_ERROR) {
+            DWORD err = ::WSAGetLastError();
+            if (err != WSA_IO_PENDING) {
+                op->self_ref.reset();
+                return IoResult{0, detail::win_error(err)};
+            }
+        }
+        bool canceled = op->wait_with_context(sock_, ctx);
+        if (canceled) {
+            return IoResult{0, std::make_error_code(std::errc::operation_canceled)};
+        }
+        if (op->error_code != 0) {
+            return IoResult{0, detail::win_error(op->error_code)};
+        }
+        return IoResult{static_cast<std::ptrdiff_t>(op->bytes_transferred), {}};
+#else
+        for (;;) {
+            ssize_t n = ::recv(sock_, buf, len, 0);
+            if (n >= 0) {
+                return IoResult{static_cast<std::ptrdiff_t>(n), {}};
+            }
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (detail::PosixPoller::instance().wait_ready(sock_, /*for_write=*/false, ctx)) {
+                    return IoResult{0, std::make_error_code(std::errc::operation_canceled)};
+                }
+                continue;
+            }
+            return IoResult{0, std::error_code(errno, std::generic_category())};
+        }
+#endif
+    }
+
+    IoResult read(void* buf, std::size_t len, std::chrono::milliseconds timeout) {
+        auto [ctx, cancel] = with_timeout(background(), timeout);
+        GORUN_DEFER { cancel(); };
+        auto res = read(buf, len, ctx);
+        if (res.ec == std::errc::operation_canceled && ctx.is_canceled()) {
+            res.ec = std::make_error_code(std::errc::timed_out);
+        }
+        return res;
+    }
+
+    /**
+     * @brief Writes up to `len` bytes from `buf`, parking the green routine until the kernel accepts data.
+     */
+    IoResult write(const void* buf, std::size_t len, Context ctx = background()) {
+        if (!is_open()) {
+            return IoResult{0, std::make_error_code(std::errc::bad_file_descriptor)};
+        }
+        if (ctx.is_canceled()) {
+            return IoResult{0, std::make_error_code(std::errc::operation_canceled)};
+        }
+
+#if defined(_WIN32)
+        auto op = std::make_shared<detail::IocpOp>();
+        op->self_ref = op;
+        WSABUF wbuf{};
+        wbuf.buf = const_cast<CHAR*>(static_cast<const CHAR*>(buf));
+        wbuf.len = static_cast<ULONG>(len);
+        DWORD sent = 0;
+        int rc = ::WSASend(sock_, &wbuf, 1, &sent, 0, &op->ov, nullptr);
+        if (rc == 0 && skip_iocp_on_sync_) {
+            op->self_ref.reset();
+            return IoResult{static_cast<std::ptrdiff_t>(sent), {}};
+        }
+        if (rc == SOCKET_ERROR) {
+            DWORD err = ::WSAGetLastError();
+            if (err != WSA_IO_PENDING) {
+                op->self_ref.reset();
+                return IoResult{0, detail::win_error(err)};
+            }
+        }
+        bool canceled = op->wait_with_context(sock_, ctx);
+        if (canceled) {
+            return IoResult{0, std::make_error_code(std::errc::operation_canceled)};
+        }
+        if (op->error_code != 0) {
+            return IoResult{0, detail::win_error(op->error_code)};
+        }
+        return IoResult{static_cast<std::ptrdiff_t>(op->bytes_transferred), {}};
+#else
+        for (;;) {
+#if defined(MSG_NOSIGNAL)
+            ssize_t n = ::send(sock_, buf, len, MSG_NOSIGNAL);
+#else
+            ssize_t n = ::send(sock_, buf, len, 0);
+#endif
+            if (n >= 0) {
+                return IoResult{static_cast<std::ptrdiff_t>(n), {}};
+            }
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (detail::PosixPoller::instance().wait_ready(sock_, /*for_write=*/true, ctx)) {
+                    return IoResult{0, std::make_error_code(std::errc::operation_canceled)};
+                }
+                continue;
+            }
+            return IoResult{0, std::error_code(errno, std::generic_category())};
+        }
+#endif
+    }
+
+    /// Writes the entire `data` slice until all bytes are sent or an error/cancellation occurs.
+    IoResult write_all(std::string_view data, Context ctx = background()) {
+        std::size_t total = 0;
+        while (total < data.size()) {
+            auto r = write(data.data() + total, data.size() - total, ctx);
+            if (!r.ok()) {
+                return IoResult{static_cast<std::ptrdiff_t>(total), r.ec};
+            }
+            if (r.bytes == 0) {
+                return IoResult{static_cast<std::ptrdiff_t>(total), std::make_error_code(std::errc::broken_pipe)};
+            }
+            total += static_cast<std::size_t>(r.bytes);
+        }
+        return IoResult{static_cast<std::ptrdiff_t>(total), {}};
+    }
+
+    IoResult write_all(std::string_view data, std::chrono::milliseconds timeout) {
+        auto [ctx, cancel] = with_timeout(background(), timeout);
+        GORUN_DEFER { cancel(); };
+        auto res = write_all(data, ctx);
+        if (res.ec == std::errc::operation_canceled && ctx.is_canceled()) {
+            res.ec = std::make_error_code(std::errc::timed_out);
+        }
+        return res;
+    }
+};
+
+/**
+ * @class TcpListener
+ * @brief Non-blocking TCP acceptor parking calling green routines on IOCP / epoll / kqueue until a peer connects.
+ */
+class TcpListener {
+#if defined(_WIN32)
+    SOCKET listen_sock_{INVALID_SOCKET};
+    bool skip_iocp_on_sync_{false};
+#else
+    int listen_sock_{-1};
+#endif
+    std::uint16_t bound_port_{0};
+
+public:
+    TcpListener() noexcept = default;
+
+    TcpListener(TcpListener&& other) noexcept
+        : listen_sock_(std::exchange(other.listen_sock_,
+#if defined(_WIN32)
+                                     INVALID_SOCKET
+#else
+                                     -1
+#endif
+                                     ))
+#if defined(_WIN32)
+        , skip_iocp_on_sync_(std::exchange(other.skip_iocp_on_sync_, false))
+#endif
+        , bound_port_(std::exchange(other.bound_port_, 0)) {}
+
+    TcpListener& operator=(TcpListener&& other) noexcept {
+        if (this != &other) {
+            close();
+            listen_sock_ = std::exchange(other.listen_sock_,
+#if defined(_WIN32)
+                                         INVALID_SOCKET
+#else
+                                         -1
+#endif
+            );
+#if defined(_WIN32)
+            skip_iocp_on_sync_ = std::exchange(other.skip_iocp_on_sync_, false);
+#endif
+            bound_port_ = std::exchange(other.bound_port_, 0);
+        }
+        return *this;
+    }
+
+    TcpListener(const TcpListener&) = delete;
+    TcpListener& operator=(const TcpListener&) = delete;
+
+    ~TcpListener() {
+        close();
+    }
+
+    [[nodiscard]] std::uint16_t local_port() const noexcept { return bound_port_; }
+
+    void close() noexcept {
+#if defined(_WIN32)
+        if (listen_sock_ != INVALID_SOCKET) {
+            SOCKET s = std::exchange(listen_sock_, INVALID_SOCKET);
+            ::CancelIoEx(reinterpret_cast<HANDLE>(s), nullptr);
+            ::closesocket(s);
+        }
+#else
+        if (listen_sock_ >= 0) {
+            int s = std::exchange(listen_sock_, -1);
+            detail::PosixPoller::instance().unregister_fd(s);
+            ::close(s);
+        }
+#endif
+    }
+
+    /**
+     * @brief Binds and listens on `host:port` (pass `port = 0` for an OS-assigned ephemeral port).
+     */
+    static TcpListener bind(std::string_view host, std::uint16_t port, int backlog = 512) {
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        std::string host_str(host);
+        if (host_str.empty() || host_str == "0.0.0.0") {
+            addr.sin_addr.s_addr = INADDR_ANY;
+        } else if (::inet_pton(AF_INET, host_str.c_str(), &addr.sin_addr) != 1) {
+            throw std::runtime_error("gorun::net::TcpListener::bind: invalid IPv4 address: " + host_str);
+        }
+
+#if defined(_WIN32)
+        auto& poller = detail::IocpPoller::instance();
+        SOCKET s = ::WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
+        if (s == INVALID_SOCKET) {
+            throw std::runtime_error("gorun::net::TcpListener::bind: WSASocket failed");
+        }
+        int reuse = 1;
+        ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+        if (::bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+            DWORD err = ::WSAGetLastError();
+            ::closesocket(s);
+            throw std::system_error(detail::win_error(err), "TcpListener::bind failed");
+        }
+        if (::listen(s, backlog) == SOCKET_ERROR) {
+            DWORD err = ::WSAGetLastError();
+            ::closesocket(s);
+            throw std::system_error(detail::win_error(err), "TcpListener::listen failed");
+        }
+        bool skip_sync = poller.associate(s);
+
+        sockaddr_in actual{};
+        int actual_len = sizeof(actual);
+        ::getsockname(s, reinterpret_cast<sockaddr*>(&actual), &actual_len);
+
+        TcpListener listener;
+        listener.listen_sock_ = s;
+        listener.skip_iocp_on_sync_ = skip_sync;
+        listener.bound_port_ = ntohs(actual.sin_port);
+        return listener;
+#else
+        int s = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (s < 0) {
+            throw std::system_error(errno, std::generic_category(), "TcpListener::bind socket()");
+        }
+        int reuse = 1;
+        ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        detail::set_nonblocking(s);
+        if (::bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
+            int err = errno;
+            ::close(s);
+            throw std::system_error(err, std::generic_category(), "TcpListener::bind()");
+        }
+        if (::listen(s, backlog) != 0) {
+            int err = errno;
+            ::close(s);
+            throw std::system_error(err, std::generic_category(), "TcpListener::listen()");
+        }
+        sockaddr_in actual{};
+        socklen_t actual_len = sizeof(actual);
+        ::getsockname(s, reinterpret_cast<sockaddr*>(&actual), &actual_len);
+
+        TcpListener listener;
+        listener.listen_sock_ = s;
+        listener.bound_port_ = ntohs(actual.sin_port);
+        return listener;
+#endif
+    }
+
+    /**
+     * @brief Accepts the next incoming TCP connection, parking the green routine until a peer connects
+     *        or `ctx` is canceled / listener is closed (returns `std::nullopt`).
+     */
+    std::optional<TcpStream> accept(Context ctx = background()) {
+#if defined(_WIN32)
+        if (listen_sock_ == INVALID_SOCKET || ctx.is_canceled()) {
+            return std::nullopt;
+        }
+        auto& poller = detail::IocpPoller::instance();
+        SOCKET client = ::WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
+        if (client == INVALID_SOCKET) {
+            return std::nullopt;
+        }
+
+        // Address buffer for AcceptEx (local + remote sockaddr_storage + 16 bytes each)
+        alignas(8) char addr_buf[(sizeof(sockaddr_in) + 16) * 2]{};
+        auto op = std::make_shared<detail::IocpOp>();
+        op->self_ref = op;
+        DWORD recvd = 0;
+
+        BOOL ok = poller.accept_ex()(
+            listen_sock_, client, addr_buf, 0,
+            sizeof(sockaddr_in) + 16, sizeof(sockaddr_in) + 16,
+            &recvd, &op->ov
+        );
+        if (ok && skip_iocp_on_sync_) {
+            op->self_ref.reset();
+        } else {
+            if (!ok) {
+                DWORD err = ::WSAGetLastError();
+                if (err != WSA_IO_PENDING) {
+                    op->self_ref.reset();
+                    ::closesocket(client);
+                    return std::nullopt;
+                }
+            }
+
+            bool canceled = op->wait_with_context(listen_sock_, ctx);
+            if (canceled || op->error_code != 0) {
+                ::closesocket(client);
+                return std::nullopt;
+            }
+        }
+
+        ::setsockopt(client, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                     reinterpret_cast<const char*>(&listen_sock_), sizeof(listen_sock_));
+        bool client_skip_sync = poller.associate(client);
+
+        sockaddr_in peer{};
+        int peer_len = sizeof(peer);
+        std::string peer_str = "unknown";
+        if (::getpeername(client, reinterpret_cast<sockaddr*>(&peer), &peer_len) == 0) {
+            char ip[INET_ADDRSTRLEN]{};
+            if (::inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip))) {
+                peer_str = std::string(ip) + ":" + std::to_string(ntohs(peer.sin_port));
+            }
+        }
+
+        TcpStream stream(client, std::move(peer_str), client_skip_sync);
+        stream.set_nodelay(true);
+        return stream;
+#else
+        if (listen_sock_ < 0 || ctx.is_canceled()) {
+            return std::nullopt;
+        }
+        for (;;) {
+            sockaddr_in peer{};
+            socklen_t peer_len = sizeof(peer);
+            int client = ::accept(listen_sock_, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+            if (client >= 0) {
+                detail::set_nonblocking(client);
+                char ip[INET_ADDRSTRLEN]{};
+                std::string peer_str = "unknown";
+                if (::inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip))) {
+                    peer_str = std::string(ip) + ":" + std::to_string(ntohs(peer.sin_port));
+                }
+                TcpStream stream(client, std::move(peer_str));
+                stream.set_nodelay(true);
+                return stream;
+            }
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (detail::PosixPoller::instance().wait_ready(listen_sock_, /*for_write=*/false, ctx)) {
+                    return std::nullopt;
+                }
+                if (listen_sock_ < 0) return std::nullopt;
+                continue;
+            }
+            return std::nullopt;
+        }
+#endif
+    }
+};
+
+} // namespace gorun::net
+// ---- end gorun/net.hpp ----
+#endif
 // ---- end gorun/gorun.hpp ----

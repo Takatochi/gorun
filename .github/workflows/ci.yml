@@ -35,7 +35,18 @@ jobs:
             generator: "Unix Makefiles"
             build_type: Debug
             cxx_flags: "-fsanitize=address,undefined -fno-omit-frame-pointer"
-          - name: "Windows x64 (MinGW-w64 GCC, Release)"
+          - name: "Ubuntu 24.04 (Clang 18, ThreadSanitizer)"
+            os: ubuntu-latest
+            compiler: clang++
+            generator: "Unix Makefiles"
+            build_type: Debug
+            cxx_flags: "-fsanitize=thread -fno-omit-frame-pointer"
+          - name: "macOS Apple Silicon (ARM64 AArch64 + kqueue, Release)"
+            os: macos-latest
+            compiler: clang++
+            generator: "Unix Makefiles"
+            build_type: Release
+          - name: "Windows x64 (MinGW-w64 GCC + IOCP, Release)"
             os: windows-latest
             compiler: g++
             generator: "MinGW Makefiles"

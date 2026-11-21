@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(gorun VERSION 0.3.0 LANGUAGES CXX ASM)
+project(gorun VERSION 0.4.0 LANGUAGES CXX ASM)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,6 +31,10 @@ else()
     target_link_libraries(gorun INTERFACE pthread)
 endif()
 
+if(WIN32)
+    target_link_libraries(gorun INTERFACE ws2_32 mswsock)
+endif()
+
 option(GORUN_BUILD_TESTS "Build gorun unit and stress tests" ${GORUN_IS_TOP_LEVEL})
 option(GORUN_BUILD_EXAMPLES "Build gorun examples" ${GORUN_IS_TOP_LEVEL})
 option(GORUN_BUILD_BENCHMARKS "Build gorun performance benchmarks" ${GORUN_IS_TOP_LEVEL})
@@ -41,6 +45,10 @@ if(GORUN_BUILD_TESTS)
     add_executable(gorun_tests tests/test_main.cpp)
     target_link_libraries(gorun_tests PRIVATE gorun::gorun)
     add_test(NAME gorun_tests COMMAND gorun_tests)
+
+    add_executable(gorun_v04_tests tests/test_v04_features.cpp)
+    target_link_libraries(gorun_v04_tests PRIVATE gorun::gorun)
+    add_test(NAME gorun_v04_tests COMMAND gorun_v04_tests)
 endif()
 
 if(GORUN_BUILD_EXAMPLES)
@@ -61,6 +69,9 @@ if(GORUN_BUILD_EXAMPLES)
 
     add_executable(example_05_memory_arenas examples/05_memory_arenas_and_pointers.cpp)
     target_link_libraries(example_05_memory_arenas PRIVATE gorun::gorun)
+
+    add_executable(example_06_http_server examples/06_native_http_server.cpp)
+    target_link_libraries(example_06_http_server PRIVATE gorun::gorun)
 endif()
 
 if(GORUN_BUILD_BENCHMARKS)
