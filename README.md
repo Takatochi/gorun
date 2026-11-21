@@ -28,7 +28,7 @@ include(FetchContent)
 FetchContent_Declare(
     gorun
     GIT_REPOSITORY https://github.com/Takatochi/gorun.git
-    GIT_TAG        v0.3.0-alpha # or main
+    GIT_TAG        v0.4.0 # or main
 )
 FetchContent_MakeAvailable(gorun)
 
@@ -66,7 +66,7 @@ cmake --install build --prefix /usr/local   # or C:/Program Files/gorun on Windo
 ```
 Then in any downstream CMake project:
 ```cmake
-find_package(gorun 0.3.0 REQUIRED CONFIG)
+find_package(gorun 0.4.0 REQUIRED CONFIG)
 target_link_libraries(my_app PRIVATE gorun::gorun)
 ```
 

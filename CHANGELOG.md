@@ -2,6 +2,22 @@
 
 All notable changes to `gorun` are documented in this file.
 
+## [v0.4.0] - 2026-11-22
+
+### Added
+- **ARM64 (AArch64) Architecture Support (`include/gorun/detail/context.hpp`):** Added AAPCS64 assembly context switching (`x19`–`x30`, `sp`, SIMD `d8`–`d15`) with Mach-O symbol prefixes for Apple Silicon (macOS M1–M4) and Linux ARM64 servers (AWS Graviton).
+- **Native Async Network Poller (`include/gorun/net.hpp`):** Built-in zero-dependency non-blocking TCP networking (`TcpListener`, `TcpStream`) over Windows IOCP (2 poller threads + `GetQueuedCompletionStatusEx` batching up to 64 completions/syscall + `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`), Linux `epoll`, and macOS/BSD `kqueue` with `gorun::Context` cancellation, zero-timer sync fast-path timeouts, and thread-safe `TcpStream::cancel_handle()`.
+- **AddressSanitizer & ThreadSanitizer Fiber Support:** Integrated `__sanitizer_start_switch_fiber` / `__sanitizer_finish_switch_fiber` (ASan) and `__tsan_create_fiber` / `__tsan_switch_to_fiber` / `__tsan_destroy_fiber` (TSan) hooks across context switches.
+- **Configurable Per-Routine Stack Sizes:** Added `gorun::StackSize` (`Small` 16 KB, `Medium` 64 KB, `Default` 128 KB, `Large` 256 KB, `XLarge` 512 KB, `Huge` 1 MB), `gorun::Options{.stack_size}`, and an 8-class multi-bucket `StackPool`.
+- **Elastic Blocking Pool & Async File I/O (`include/gorun/blocking.hpp`):** Added `gorun::spawn_blocking` and non-blocking `gorun::fs` helpers (`read_file`, `write_file`, `append_file`, `file_size`, `exists`) to offload blocking OS/C-library calls without stalling M:N workers.
+- **Bidirectional C++20 `co_await` Bridge (`include/gorun/coro.hpp`):** Made `JoinHandle<T>` and `Channel<T>` (`co_recv`, `co_send`) awaitable, and added `gorun::Task<T>` + `gorun::await_coro(...)` to await external C++20 coroutines from inside green routines.
+- **Live Scheduler Observability:** Added `Runtime::stats()` returning `RuntimeStats` (workers, active/parked/running routines, global/local queue depths, work-stealing count, pending timers, and `StackPool` metrics).
+- **Packaging & Reference Server:** Added vcpkg (`packaging/vcpkg/`) and Conan 2.0 (`packaging/conan/`) recipes, a zero-dependency native HTTP/1.1 server example (`examples/06_native_http_server.cpp`), v0.4.0 test suite (`tests/test_v04_features.cpp`), and macOS ARM64 + Linux TSan jobs in CI.
+
+### Fixed
+- **Deterministic Structured Concurrency Cleanup:** Destroyed task captures and flushed `RoutineLocal<T>` (`cur->clear_locals()`) strictly **before** signaling completion in `TaskGroup::spawn` (`wg_.done()`), `go_async` (`mark_ready()`), and `Runtime::block_on` (`notify_done()`), eliminating a shutdown race where `~Scope()` could return on another core before a child routine's `RoutineLocal<T>` destructors finished (`[TEST 24]`).
+- **Scheduler Wakeups:** Improved external `global_queue_` worker notification and early-wake reset to prevent sleep stalls under bursty workloads.
+
 ## [v0.3.0-alpha] - 2026-11-21
 
 ### Security & Concurrency Hardening
