@@ -1383,7 +1383,7 @@ int main() {
     }
 
     function stripAnsi(text) {
-      return String(text || '').replace(/\x1b\[[0-9;]*m/g, '');
+      return String(text || '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
     }
 
     function appendConsoleLine(text, cls) {
