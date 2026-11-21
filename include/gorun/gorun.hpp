@@ -24,3 +24,8 @@
 #include "gorun/channel.hpp"
 #include "gorun/context_go.hpp"
 #include "gorun/task_group.hpp"
+#include "gorun/blocking.hpp"
+#include "gorun/coro.hpp"
+#if !defined(GORUN_DISABLE_NET)
+#include "gorun/net.hpp"
+#endif
