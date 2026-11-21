@@ -938,6 +938,7 @@ inline Runtime::~Runtime() {
 
 inline void Runtime::schedule(detail::Routine* r) noexcept {
     r->state = detail::RoutineState::Ready;
+    bool pushed_to_global = false;
     bool should_wake = false;
     detail::Worker* w = detail::current_worker();
     if (w && &w->runtime() == this) {
@@ -946,16 +947,18 @@ inline void Runtime::schedule(detail::Routine* r) noexcept {
         should_wake = w->local_queue_.push_run_next(r);
     } else {
         global_queue_.push_back(r);
+        pushed_to_global = true;
         should_wake = true;
     }
 
     if (should_wake) {
         // Full fence pairs with sleeping_workers_.fetch_add(seq_cst) in Worker::run_loop() to prevent lost wakeups!
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (sleeping_workers_.load(std::memory_order_seq_cst) > 0 &&
-            waking_workers_.exchange(1, std::memory_order_acq_rel) == 0) {
-            std::lock_guard lk(sleep_mutex_);
-            sleep_cv_.notify_one();
+        if (sleeping_workers_.load(std::memory_order_seq_cst) > 0) {
+            if (pushed_to_global || waking_workers_.exchange(1, std::memory_order_acq_rel) == 0) {
+                std::lock_guard lk(sleep_mutex_);
+                sleep_cv_.notify_one();
+            }
         }
     }
 }
