@@ -27,6 +27,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "gorun/channel.hpp"
 #include "gorun/context_go.hpp"
@@ -189,9 +190,10 @@ struct IocpOp {
 
 class IocpPoller {
     static constexpr ULONG_PTR kShutdownKey = 0xDEADBEEFu;
+    static constexpr std::size_t kPollerThreads = 2;
 
     HANDLE iocp_{nullptr};
-    std::jthread poller_thread_;
+    std::vector<std::jthread> poller_threads_;
     LPFN_ACCEPTEX accept_ex_{nullptr};
     LPFN_CONNECTEX connect_ex_{nullptr};
 
@@ -214,42 +216,56 @@ class IocpPoller {
     }
 
     void poll_loop() {
+        OVERLAPPED_ENTRY entries[64];
         for (;;) {
-            DWORD bytes = 0;
-            ULONG_PTR key = 0;
-            LPOVERLAPPED ov = nullptr;
-            BOOL ok = ::GetQueuedCompletionStatus(iocp_, &bytes, &key, &ov, INFINITE);
-
-            if (key == kShutdownKey && ov == nullptr) {
-                return;
-            }
-            if (!ov) {
+            ULONG count = 0;
+            BOOL ok = ::GetQueuedCompletionStatusEx(iocp_, entries, 64, &count, INFINITE, FALSE);
+            if (!ok || count == 0) {
                 continue;
             }
-
-            DWORD err = ok ? 0 : ::GetLastError();
-            auto* op = reinterpret_cast<IocpOp*>(ov);
-            std::shared_ptr<IocpOp> keep_alive = std::move(op->self_ref);
-            op->complete(bytes, err);
+            for (ULONG i = 0; i < count; ++i) {
+                const auto& e = entries[i];
+                if (e.lpCompletionKey == kShutdownKey && e.lpOverlapped == nullptr) {
+                    return;
+                }
+                if (!e.lpOverlapped) {
+                    continue;
+                }
+                DWORD err = 0;
+                if (e.Internal != 0) {
+                    // STATUS_CANCELLED (0xC0000120) -> ERROR_OPERATION_ABORTED, otherwise map non-zero NTSTATUS
+                    err = (static_cast<std::uint32_t>(e.Internal) == 0xC0000120u)
+                              ? ERROR_OPERATION_ABORTED
+                              : WSAECONNRESET;
+                }
+                auto* op = reinterpret_cast<IocpOp*>(e.lpOverlapped);
+                std::shared_ptr<IocpOp> keep_alive = std::move(op->self_ref);
+                op->complete(e.dwNumberOfBytesTransferred, err);
+            }
         }
     }
 
 public:
     IocpPoller() {
         ensure_wsa();
-        iocp_ = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
+        iocp_ = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, static_cast<DWORD>(kPollerThreads));
         if (!iocp_) {
             throw std::runtime_error("gorun::net: CreateIoCompletionPort failed");
         }
         load_extension_fns();
-        poller_thread_ = std::jthread([this]() { poll_loop(); });
+        poller_threads_.reserve(kPollerThreads);
+        for (std::size_t i = 0; i < kPollerThreads; ++i) {
+            poller_threads_.emplace_back([this]() { poll_loop(); });
+        }
     }
 
     ~IocpPoller() {
         if (iocp_) {
-            ::PostQueuedCompletionStatus(iocp_, 0, kShutdownKey, nullptr);
-            if (poller_thread_.joinable()) {
-                poller_thread_.join();
+            for (std::size_t i = 0; i < poller_threads_.size(); ++i) {
+                ::PostQueuedCompletionStatus(iocp_, 0, kShutdownKey, nullptr);
+            }
+            for (auto& t : poller_threads_) {
+                if (t.joinable()) t.join();
             }
             ::CloseHandle(iocp_);
             iocp_ = nullptr;
@@ -516,6 +532,33 @@ public:
 
 #endif
 
+/// Thread-safe external cancellation handle allowing servers (`HttpServer::stop()`) to wake idle readers cleanly.
+struct CancelState {
+#if defined(_WIN32)
+    std::atomic<SOCKET> raw_sock{INVALID_SOCKET};
+    explicit CancelState(SOCKET s) noexcept : raw_sock(s) {}
+    void invalidate() noexcept { raw_sock.store(INVALID_SOCKET, std::memory_order_release); }
+    void cancel_io() noexcept {
+        SOCKET s = raw_sock.load(std::memory_order_acquire);
+        if (s != INVALID_SOCKET) {
+            ::CancelIoEx(reinterpret_cast<HANDLE>(s), nullptr);
+            ::shutdown(s, SD_BOTH);
+        }
+    }
+#else
+    std::atomic<int> raw_sock{-1};
+    explicit CancelState(int s) noexcept : raw_sock(s) {}
+    void invalidate() noexcept { raw_sock.store(-1, std::memory_order_release); }
+    void cancel_io() noexcept {
+        int s = raw_sock.load(std::memory_order_acquire);
+        if (s >= 0) {
+            ::shutdown(s, SHUT_RDWR);
+            PosixPoller::instance().unregister_fd(s);
+        }
+    }
+#endif
+};
+
 } // namespace detail
 
 /**
@@ -529,15 +572,22 @@ class TcpStream {
 #else
     int sock_{-1};
 #endif
+    std::shared_ptr<detail::CancelState> cancel_state_{};
     std::string peer_addr_{};
 
     friend class TcpListener;
 
 #if defined(_WIN32)
-    TcpStream(SOCKET s, std::string peer, bool skip_sync = false) noexcept
-        : sock_(s), skip_iocp_on_sync_(skip_sync), peer_addr_(std::move(peer)) {}
+    TcpStream(SOCKET s, std::string peer, bool skip_sync = false)
+        : sock_(s)
+        , skip_iocp_on_sync_(skip_sync)
+        , cancel_state_(std::make_shared<detail::CancelState>(s))
+        , peer_addr_(std::move(peer)) {}
 #else
-    TcpStream(int s, std::string peer) noexcept : sock_(s), peer_addr_(std::move(peer)) {}
+    TcpStream(int s, std::string peer)
+        : sock_(s)
+        , cancel_state_(std::make_shared<detail::CancelState>(s))
+        , peer_addr_(std::move(peer)) {}
 #endif
 
 public:
@@ -554,6 +604,7 @@ public:
 #if defined(_WIN32)
         , skip_iocp_on_sync_(std::exchange(other.skip_iocp_on_sync_, false))
 #endif
+        , cancel_state_(std::move(other.cancel_state_))
         , peer_addr_(std::move(other.peer_addr_)) {}
 
     TcpStream& operator=(TcpStream&& other) noexcept {
@@ -569,6 +620,7 @@ public:
 #if defined(_WIN32)
             skip_iocp_on_sync_ = std::exchange(other.skip_iocp_on_sync_, false);
 #endif
+            cancel_state_ = std::move(other.cancel_state_);
             peer_addr_ = std::move(other.peer_addr_);
         }
         return *this;
@@ -579,6 +631,11 @@ public:
 
     ~TcpStream() {
         close();
+    }
+
+    /// Returns a weak cancellation handle safe to call from another thread/routine during graceful shutdown.
+    [[nodiscard]] std::weak_ptr<detail::CancelState> cancel_handle() const noexcept {
+        return cancel_state_;
     }
 
     [[nodiscard]] bool is_open() const noexcept {
@@ -612,6 +669,9 @@ public:
 
     void close() noexcept {
         if (!is_open()) return;
+        if (cancel_state_) {
+            cancel_state_->invalidate();
+        }
 #if defined(_WIN32)
         SOCKET s = std::exchange(sock_, INVALID_SOCKET);
         ::CancelIoEx(reinterpret_cast<HANDLE>(s), nullptr);
@@ -774,7 +834,51 @@ public:
 #endif
     }
 
+    /// Zero-timer fast-path timeout read: only arms a timer if the kernel returns pending/EAGAIN!
     IoResult read(void* buf, std::size_t len, std::chrono::milliseconds timeout) {
+        if (!is_open()) {
+            return IoResult{0, std::make_error_code(std::errc::bad_file_descriptor)};
+        }
+#if defined(_WIN32)
+        auto op = std::make_shared<detail::IocpOp>();
+        op->self_ref = op;
+        WSABUF wbuf{};
+        wbuf.buf = static_cast<CHAR*>(buf);
+        wbuf.len = static_cast<ULONG>(len);
+        DWORD flags = 0;
+        DWORD recvd = 0;
+        int rc = ::WSARecv(sock_, &wbuf, 1, &recvd, &flags, &op->ov, nullptr);
+        if (rc == 0 && skip_iocp_on_sync_) {
+            op->self_ref.reset();
+            return IoResult{static_cast<std::ptrdiff_t>(recvd), {}};
+        }
+        if (rc == SOCKET_ERROR) {
+            DWORD err = ::WSAGetLastError();
+            if (err != WSA_IO_PENDING) {
+                op->self_ref.reset();
+                return IoResult{0, detail::win_error(err)};
+            }
+        }
+        // Only arm a timeout if the read actually parked asynchronously!
+        auto [ctx, cancel] = with_timeout(background(), timeout);
+        GORUN_DEFER { cancel(); };
+        bool canceled = op->wait_with_context(sock_, ctx);
+        if (canceled) {
+            return IoResult{0, std::make_error_code(std::errc::timed_out)};
+        }
+        if (op->error_code != 0) {
+            return IoResult{0, detail::win_error(op->error_code)};
+        }
+        return IoResult{static_cast<std::ptrdiff_t>(op->bytes_transferred), {}};
+#else
+        // Fast path: try immediate non-blocking recv before allocating a timeout Context
+        for (;;) {
+            ssize_t n = ::recv(sock_, buf, len, 0);
+            if (n >= 0) return IoResult{static_cast<std::ptrdiff_t>(n), {}};
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            return IoResult{0, std::error_code(errno, std::generic_category())};
+        }
         auto [ctx, cancel] = with_timeout(background(), timeout);
         GORUN_DEFER { cancel(); };
         auto res = read(buf, len, ctx);
@@ -782,6 +886,7 @@ public:
             res.ec = std::make_error_code(std::errc::timed_out);
         }
         return res;
+#endif
     }
 
     /**
@@ -860,14 +965,77 @@ public:
         return IoResult{static_cast<std::ptrdiff_t>(total), {}};
     }
 
+    /// Zero-timer fast-path timeout write_all: skips Context/timer allocation when writes complete synchronously!
     IoResult write_all(std::string_view data, std::chrono::milliseconds timeout) {
-        auto [ctx, cancel] = with_timeout(background(), timeout);
-        GORUN_DEFER { cancel(); };
-        auto res = write_all(data, ctx);
-        if (res.ec == std::errc::operation_canceled && ctx.is_canceled()) {
-            res.ec = std::make_error_code(std::errc::timed_out);
+        if (!is_open()) {
+            return IoResult{0, std::make_error_code(std::errc::bad_file_descriptor)};
         }
-        return res;
+        std::size_t total = 0;
+        while (total < data.size()) {
+#if defined(_WIN32)
+            auto op = std::make_shared<detail::IocpOp>();
+            op->self_ref = op;
+            WSABUF wbuf{};
+            wbuf.buf = const_cast<CHAR*>(data.data() + total);
+            wbuf.len = static_cast<ULONG>(data.size() - total);
+            DWORD sent = 0;
+            int rc = ::WSASend(sock_, &wbuf, 1, &sent, 0, &op->ov, nullptr);
+            if (rc == 0 && skip_iocp_on_sync_) {
+                op->self_ref.reset();
+                if (sent == 0) {
+                    return IoResult{static_cast<std::ptrdiff_t>(total), std::make_error_code(std::errc::broken_pipe)};
+                }
+                total += static_cast<std::size_t>(sent);
+                continue;
+            }
+            if (rc == SOCKET_ERROR) {
+                DWORD err = ::WSAGetLastError();
+                if (err != WSA_IO_PENDING) {
+                    op->self_ref.reset();
+                    return IoResult{static_cast<std::ptrdiff_t>(total), detail::win_error(err)};
+                }
+            }
+            auto [ctx, cancel] = with_timeout(background(), timeout);
+            GORUN_DEFER { cancel(); };
+            bool canceled = op->wait_with_context(sock_, ctx);
+            if (canceled) {
+                return IoResult{static_cast<std::ptrdiff_t>(total), std::make_error_code(std::errc::timed_out)};
+            }
+            if (op->error_code != 0) {
+                return IoResult{static_cast<std::ptrdiff_t>(total), detail::win_error(op->error_code)};
+            }
+            if (op->bytes_transferred == 0) {
+                return IoResult{static_cast<std::ptrdiff_t>(total), std::make_error_code(std::errc::broken_pipe)};
+            }
+            total += static_cast<std::size_t>(op->bytes_transferred);
+#else
+#if defined(MSG_NOSIGNAL)
+            ssize_t n = ::send(sock_, data.data() + total, data.size() - total, MSG_NOSIGNAL);
+#else
+            ssize_t n = ::send(sock_, data.data() + total, data.size() - total, 0);
+#endif
+            if (n > 0) {
+                total += static_cast<std::size_t>(n);
+                continue;
+            }
+            if (n == 0) {
+                return IoResult{static_cast<std::ptrdiff_t>(total), std::make_error_code(std::errc::broken_pipe)};
+            }
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                return IoResult{static_cast<std::ptrdiff_t>(total), std::error_code(errno, std::generic_category())};
+            }
+            auto [ctx, cancel] = with_timeout(background(), timeout);
+            GORUN_DEFER { cancel(); };
+            auto rest = write_all(data.substr(total), ctx);
+            total += static_cast<std::size_t>(rest.bytes);
+            if (rest.ec == std::errc::operation_canceled && ctx.is_canceled()) {
+                rest.ec = std::make_error_code(std::errc::timed_out);
+            }
+            return IoResult{static_cast<std::ptrdiff_t>(total), rest.ec};
+#endif
+        }
+        return IoResult{static_cast<std::ptrdiff_t>(total), {}};
     }
 };
 
