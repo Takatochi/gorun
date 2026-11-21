@@ -70,6 +70,17 @@ find_package(gorun 0.4.0 REQUIRED CONFIG)
 target_link_libraries(my_app PRIVATE gorun::gorun)
 ```
 
+### Option 5: vcpkg & Conan 2.0 Package Managers
+Ready-to-use port/recipe files are bundled in [`packaging/vcpkg/`](./packaging/vcpkg/) and [`packaging/conan/`](./packaging/conan/):
+
+```bash
+# vcpkg (overlay port):
+vcpkg install gorun --overlay-ports=./packaging/vcpkg
+
+# Conan 2.0 (local recipe + test_package):
+conan create packaging/conan --version=0.4.0 --build=missing
+```
+
 ### Minimal 15-Line Example (`main.cpp`)
 ```cpp
 #include <iostream>
