@@ -37,10 +37,27 @@
 #endif
 #endif
 
+#if defined(__SANITIZE_THREAD__)
+#define GORUN_HAS_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define GORUN_HAS_TSAN 1
+#endif
+#endif
+
 #if defined(GORUN_HAS_ASAN)
 extern "C" {
 void __sanitizer_start_switch_fiber(void** fake_stack_save, const void* bottom, std::size_t size);
 void __sanitizer_finish_switch_fiber(void* fake_stack_save, const void** bottom_old, std::size_t* size_old);
+}
+#endif
+
+#if defined(GORUN_HAS_TSAN)
+extern "C" {
+void* __tsan_get_current_fiber(void);
+void* __tsan_create_fiber(unsigned flags);
+void  __tsan_destroy_fiber(void* fiber);
+void  __tsan_switch_to_fiber(void* fiber, unsigned flags);
 }
 #endif
 
@@ -76,6 +93,26 @@ struct Config {
      * @brief Maximum number of idle routine stacks cached in `StackPool` for zero-syscall reuse.
      */
     std::size_t max_pooled_stacks = 1024;
+};
+
+/**
+ * @struct RuntimeStats
+ * @brief Live scheduler introspection snapshot returned by `Runtime::stats()` (Prometheus/Grafana ready).
+ */
+struct RuntimeStats {
+    std::size_t worker_count{0};            ///< Total OS worker threads
+    std::size_t sleeping_workers{0};        ///< OS worker threads currently parked on idle CV
+    std::size_t active_routines{0};         ///< Unfinished routines (Ready + Running + Parked)
+    std::size_t parked_routines{0};         ///< Routines currently parked on Channel/Mutex/Timer/NetPoller
+    std::size_t running_routines{0};        ///< Routines actively executing on worker threads right now
+    std::size_t global_queue_size{0};       ///< Routines waiting in the Global Run Queue
+    std::vector<std::size_t> local_queue_sizes{}; ///< Per-worker local deque sizes
+    std::size_t total_local_queued{0};      ///< Sum of all per-worker local deque sizes
+    std::uint64_t total_spawned{0};         ///< Lifetime routines spawned on this Runtime
+    std::uint64_t total_completed{0};       ///< Lifetime routines completed on this Runtime
+    std::uint64_t total_steals{0};          ///< Lifetime successful work-stealing events across workers
+    std::size_t pending_timers{0};          ///< Currently armed timers in the timer wheel/map
+    StackPoolStats stack_pool{};            ///< Multi-bucket StackPool allocations, cache hits & cached bytes
 };
 
 namespace detail {
@@ -262,6 +299,18 @@ struct Routine {
 #if defined(GORUN_HAS_ASAN)
     void* asan_fake_stack{nullptr};
 #endif
+#if defined(GORUN_HAS_TSAN)
+    void* tsan_fiber{nullptr};
+#endif
+
+    ~Routine() noexcept {
+#if defined(GORUN_HAS_TSAN)
+        if (tsan_fiber) {
+            __tsan_destroy_fiber(tsan_fiber);
+            tsan_fiber = nullptr;
+        }
+#endif
+    }
 
     void clear_locals() noexcept {
         routine_locals.clear();
@@ -394,6 +443,11 @@ private:
     std::atomic<std::size_t> sleeping_workers_{0};
     std::atomic<std::uint32_t> waking_workers_{0};
     std::atomic<std::size_t> active_routines_{0};
+    std::atomic<std::size_t> parked_routines_{0};
+    std::atomic<std::size_t> running_routines_{0};
+    std::atomic<std::uint64_t> total_spawned_{0};
+    std::atomic<std::uint64_t> total_completed_{0};
+    std::atomic<std::uint64_t> total_steals_{0};
     std::atomic<bool> shutdown_{false};
 
     // Cancellable timer queue (O(log N) insert, O(1) earliest peek, O(log N) cancel with zero timer leaks!)
@@ -417,7 +471,7 @@ private:
 
     static void routine_trampoline(void* arg) noexcept;
 
-    detail::Routine* acquire_routine(detail::UniqueTask fn);
+    detail::Routine* acquire_routine(detail::UniqueTask fn, std::size_t requested_stack_size = 0);
     void release_routine(detail::Routine* r) noexcept;
     void timer_loop();
 
@@ -462,27 +516,43 @@ public:
     bool cancel_timer(std::uint64_t timer_id) noexcept;
 
     /**
-     * @brief Spawns a new green routine on this `Runtime` instance (supports move-only callables!).
+     * @brief Spawns a new green routine on this `Runtime` instance (supports move-only callables and custom stack sizes).
      * @tparam F Callable type `void()`.
      * @param fn Callable task body.
+     * @param stack_size Optional usable stack size in bytes (`0` = `Config::default_stack_size`).
      */
     template <typename F>
-    void spawn_raw(F&& fn) {
+    void spawn_raw(F&& fn, std::size_t stack_size = 0) {
         // Acquire routine BEFORE incrementing active_routines_ so std::bad_alloc never deadlocks wait_idle()!
-        detail::Routine* r = acquire_routine(detail::UniqueTask(std::forward<F>(fn)));
+        detail::Routine* r = acquire_routine(detail::UniqueTask(std::forward<F>(fn)), stack_size);
         r->implicit_scope = detail::current_implicit_scope();
         active_routines_.fetch_add(1, std::memory_order_relaxed);
+        total_spawned_.fetch_add(1, std::memory_order_relaxed);
         schedule(r);
     }
 
     /**
      * @brief Spawns a green routine on this `Runtime` instance.
-     * @tparam F Callable type `void()`.
-     * @param fn Callable task body.
      */
     template <typename F>
     void go(F&& fn) {
-        spawn_raw(std::forward<F>(fn));
+        spawn_raw(std::forward<F>(fn), 0);
+    }
+
+    /**
+     * @brief Spawns a green routine with a predefined `StackSize` (`Small`, `Compact`, `Default`, `Medium`, `Large`, `Huge`).
+     */
+    template <typename F>
+    void go(StackSize sz, F&& fn) {
+        spawn_raw(std::forward<F>(fn), static_cast<std::size_t>(sz));
+    }
+
+    /**
+     * @brief Spawns a green routine with explicit `Options` (e.g. `Options{.stack_size = 512 * 1024}`).
+     */
+    template <typename F>
+    void go(Options opts, F&& fn) {
+        spawn_raw(std::forward<F>(fn), opts.stack_size);
     }
 
     /**
@@ -525,6 +595,12 @@ public:
         std::lock_guard lock(timer_mutex_);
         return timer_index_.size();
     }
+
+    /**
+     * @brief Captures a live observability snapshot of scheduler queues, active/parked routines,
+     *        work-stealing steals, timers, and multi-bucket `StackPool` usage.
+     */
+    [[nodiscard]] RuntimeStats stats() noexcept;
 };
 
 /**
@@ -566,6 +642,9 @@ class Worker {
     const void* asan_scheduler_bottom_{nullptr};
     std::size_t asan_scheduler_size_{0};
 #endif
+#if defined(GORUN_HAS_TSAN)
+    void* tsan_scheduler_fiber_{nullptr};
+#endif
 
 public:
     Worker(Runtime& rt, std::size_t idx)
@@ -577,6 +656,7 @@ public:
     [[nodiscard]] std::size_t index() const noexcept { return index_; }
     [[nodiscard]] ExecutionContext& scheduler_context() noexcept { return scheduler_ctx_; }
     [[nodiscard]] std::vector<std::unique_ptr<Routine>>& local_free_routines() noexcept { return local_free_routines_; }
+    [[nodiscard]] std::size_t local_queue_size() const noexcept { return local_queue_.size(); }
 
 #if defined(GORUN_HAS_ASAN)
     void asan_before_switch_to_routine(Routine* r) noexcept {
@@ -602,21 +682,16 @@ public:
     }
 #endif
 
-    /**
-     * @brief Atomically transitions the current routine to `Parked`, switches CPU context to `scheduler_ctx_`,
-     *        and releases `primitive_lock` **after** the routine's registers are safely saved on its stack.
-     *
-     * @note Direct C++ equivalent of Go's `gopark(unlockf, lock)` in `runtime/proc.go`.
-     * Prevents both **Lost Wakeup** and **Premature Dual-Core Stack Execution**.
-     *
-     * @param primitive_lock Already-acquired spinlock of the synchronization primitive (`Channel`, `Mutex`, `WaitGroup`).
-     */
     void park_locked(SpinLock& primitive_lock) noexcept {
         Routine* r = current_routine_;
         r->state = RoutineState::Parked;
+        runtime_.parked_routines_.fetch_add(1, std::memory_order_relaxed);
         pending_unlock_ = &primitive_lock;
 #if defined(GORUN_HAS_ASAN)
         asan_before_switch_to_scheduler(r, false);
+#endif
+#if defined(GORUN_HAS_TSAN)
+        __tsan_switch_to_fiber(tsan_scheduler_fiber_, 0);
 #endif
         context_switch(&r->ctx, &scheduler_ctx_);
 #if defined(GORUN_HAS_ASAN)
@@ -624,9 +699,6 @@ public:
 #endif
     }
 
-    /**
-     * @brief Cooperatively yields execution back to the scheduler (`this_routine::yield()`), keeping the routine `Ready`.
-     */
     void yield_current() noexcept {
         Routine* r = current_routine_;
         r->state = RoutineState::Ready;
@@ -634,21 +706,24 @@ public:
 #if defined(GORUN_HAS_ASAN)
         asan_before_switch_to_scheduler(r, false);
 #endif
+#if defined(GORUN_HAS_TSAN)
+        __tsan_switch_to_fiber(tsan_scheduler_fiber_, 0);
+#endif
         context_switch(&r->ctx, &scheduler_ctx_);
 #if defined(GORUN_HAS_ASAN)
         current_worker()->asan_after_switch_to_routine(r);
 #endif
     }
 
-    /**
-     * @brief Marks the current routine as `Finished` and switches back to the worker scheduler loop for stack recycling.
-     */
     void finish_current() noexcept {
         Routine* r = current_routine_;
         r->state = RoutineState::Finished;
         finish_requested_ = true;
 #if defined(GORUN_HAS_ASAN)
         asan_before_switch_to_scheduler(r, false);
+#endif
+#if defined(GORUN_HAS_TSAN)
+        __tsan_switch_to_fiber(tsan_scheduler_fiber_, 0);
 #endif
         context_switch(&r->ctx, &scheduler_ctx_);
 #if defined(GORUN_HAS_ASAN)
@@ -695,6 +770,7 @@ public:
                 if (victim_idx == index_) continue;
                 Worker* victim = runtime_.workers_[victim_idx].get();
                 if (Routine* stolen = victim->local_queue_.steal_half_into(local_queue_)) {
+                    runtime_.total_steals_.fetch_add(1, std::memory_order_relaxed);
                     return stolen;
                 }
             }
@@ -709,6 +785,9 @@ public:
     void run_loop() {
         tls_current_worker() = this;
         scheduler_ctx_.init_scheduler_for_current_thread();
+#if defined(GORUN_HAS_TSAN)
+        tsan_scheduler_fiber_ = __tsan_get_current_fiber();
+#endif
 
         while (!runtime_.shutdown_.load(std::memory_order_acquire)) {
             Routine* r = find_runnable();
@@ -756,15 +835,20 @@ public:
             current_routine_ = r;
             tls_current_routine() = r;
             r->state = RoutineState::Running;
+            runtime_.running_routines_.fetch_add(1, std::memory_order_relaxed);
 
 #if defined(GORUN_HAS_ASAN)
             asan_before_switch_to_routine(r);
+#endif
+#if defined(GORUN_HAS_TSAN)
+            __tsan_switch_to_fiber(r->tsan_fiber, 0);
 #endif
             context_switch(&scheduler_ctx_, &r->ctx);
 #if defined(GORUN_HAS_ASAN)
             asan_after_switch_to_scheduler();
 #endif
 
+            runtime_.running_routines_.fetch_sub(1, std::memory_order_relaxed);
             current_routine_ = nullptr;
             tls_current_routine() = nullptr;
 
@@ -780,6 +864,7 @@ public:
             } else if (finish_requested_) {
                 finish_requested_ = false;
                 runtime_.release_routine(r);
+                runtime_.total_completed_.fetch_add(1, std::memory_order_relaxed);
                 if (runtime_.active_routines_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     std::lock_guard lk(runtime_.sleep_mutex_);
                     runtime_.sleep_cv_.notify_all();
@@ -834,25 +919,36 @@ inline void Runtime::routine_trampoline(void* arg) noexcept {
     }
 }
 
-inline detail::Routine* Runtime::acquire_routine(detail::UniqueTask fn) {
+inline detail::Routine* Runtime::acquire_routine(detail::UniqueTask fn, std::size_t requested_stack_size) {
+    const std::size_t default_usable = stack_pool_.default_usable_size();
+    const std::size_t target_usable = (requested_stack_size == 0)
+        ? default_usable
+        : detail::StackPool::normalize_size(requested_stack_size);
+    const bool is_default_size = (target_usable == default_usable);
+
     std::unique_ptr<detail::Routine> r;
-    detail::Worker* w = detail::current_worker();
-    if (w && &w->runtime() == this && !w->local_free_routines().empty()) {
-        r = std::move(w->local_free_routines().back());
-        w->local_free_routines().pop_back();
-    } else {
-        std::lock_guard lock(routine_pool_mutex_);
-        if (!routine_pool_.empty()) {
-            r = std::move(routine_pool_.back());
-            routine_pool_.pop_back();
+    if (is_default_size) {
+        detail::Worker* w = detail::current_worker();
+        if (w && &w->runtime() == this && !w->local_free_routines().empty()) {
+            r = std::move(w->local_free_routines().back());
+            w->local_free_routines().pop_back();
+        } else {
+            std::lock_guard lock(routine_pool_mutex_);
+            if (!routine_pool_.empty()) {
+                r = std::move(routine_pool_.back());
+                routine_pool_.pop_back();
+            }
         }
     }
 
     if (!r) {
         r = std::make_unique<detail::Routine>();
         r->owner_runtime = this;
-        r->stack = stack_pool_.acquire();
+        r->stack = stack_pool_.acquire(target_usable);
         r->ctx.make_routine_stack_context(r->stack, &Runtime::routine_trampoline, r.get());
+#if defined(GORUN_HAS_TSAN)
+        r->tsan_fiber = __tsan_create_fiber(0);
+#endif
     }
 
     r->id = next_routine_id_.fetch_add(1, std::memory_order_relaxed);
@@ -865,18 +961,22 @@ inline detail::Routine* Runtime::acquire_routine(detail::UniqueTask fn) {
 
 inline void Runtime::release_routine(detail::Routine* r) noexcept {
     std::unique_ptr<detail::Routine> ptr(r);
-    detail::Worker* w = detail::current_worker();
-    if (w && &w->runtime() == this && w->local_free_routines().size() < 64) {
-        w->local_free_routines().push_back(std::move(ptr));
-        return;
-    }
-    {
-        std::lock_guard lock(routine_pool_mutex_);
-        if (routine_pool_.size() < config_.max_pooled_stacks) {
-            routine_pool_.push_back(std::move(ptr));
+    const bool is_default_size = (ptr->stack.usable_bytes == stack_pool_.default_usable_size());
+    if (is_default_size) {
+        detail::Worker* w = detail::current_worker();
+        if (w && &w->runtime() == this && w->local_free_routines().size() < 64) {
+            w->local_free_routines().push_back(std::move(ptr));
             return;
         }
+        {
+            std::lock_guard lock(routine_pool_mutex_);
+            if (routine_pool_.size() < config_.max_pooled_stacks) {
+                routine_pool_.push_back(std::move(ptr));
+                return;
+            }
+        }
     }
+    // Custom-sized stacks return directly to their matching bucket in StackPool!
     stack_pool_.release(ptr->stack);
 }
 
@@ -937,6 +1037,9 @@ inline Runtime::~Runtime() {
 }
 
 inline void Runtime::schedule(detail::Routine* r) noexcept {
+    if (r->state == detail::RoutineState::Parked) {
+        parked_routines_.fetch_sub(1, std::memory_order_relaxed);
+    }
     r->state = detail::RoutineState::Ready;
     bool pushed_to_global = false;
     bool should_wake = false;
@@ -1044,6 +1147,28 @@ inline void Runtime::wait_idle() noexcept {
     sleep_cv_.wait(lock, [this]() {
         return active_routines_.load(std::memory_order_acquire) == 0;
     });
+}
+
+inline RuntimeStats Runtime::stats() noexcept {
+    RuntimeStats s;
+    s.worker_count = config_.worker_count;
+    s.sleeping_workers = sleeping_workers_.load(std::memory_order_relaxed);
+    s.active_routines = active_routines_.load(std::memory_order_acquire);
+    s.parked_routines = parked_routines_.load(std::memory_order_relaxed);
+    s.running_routines = running_routines_.load(std::memory_order_relaxed);
+    s.global_queue_size = global_queue_.size();
+    s.local_queue_sizes.reserve(workers_.size());
+    for (const auto& w : workers_) {
+        std::size_t qsz = w->local_queue_size();
+        s.local_queue_sizes.push_back(qsz);
+        s.total_local_queued += qsz;
+    }
+    s.total_spawned = total_spawned_.load(std::memory_order_relaxed);
+    s.total_completed = total_completed_.load(std::memory_order_relaxed);
+    s.total_steals = total_steals_.load(std::memory_order_relaxed);
+    s.pending_timers = pending_timer_count();
+    s.stack_pool = stack_pool_.stats();
+    return s;
 }
 
 template <std::invocable F>
@@ -1172,6 +1297,16 @@ void sleep_for(std::chrono::duration<Rep, Period> duration) {
         return r->stop_source.get_token();
     }
     return std::stop_token{};
+}
+
+/**
+ * @brief Returns the usable virtual-memory stack size (in bytes) of the current green routine, or `0` on external OS threads.
+ */
+[[nodiscard]] inline std::size_t stack_size() noexcept {
+    if (detail::Routine* r = detail::current_routine()) {
+        return r->stack.usable_bytes;
+    }
+    return 0;
 }
 
 } // namespace this_routine

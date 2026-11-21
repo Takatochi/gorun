@@ -218,6 +218,10 @@ private:
 public:
     Context() : node_(std::make_shared<detail::ContextNode>(false)) {}
 
+    [[nodiscard]] bool can_cancel() const noexcept {
+        return node_ && node_->cancellable;
+    }
+
     [[nodiscard]] bool is_canceled() const noexcept {
         return node_->err_.load(std::memory_order_acquire) != ContextError::None;
     }

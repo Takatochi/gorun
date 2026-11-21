@@ -2,10 +2,14 @@
 
 /**
  * @file stack_pool.hpp
- * @brief Virtual memory stack allocator and recycling pool (`StackPool`) with hardware Guard Pages.
+ * @brief Multi-bucket virtual-memory stack allocator and recycling pool (`StackPool`) with
+ *        hardware Guard Pages, configurable per-routine stack sizes (`StackSize`, `Options`),
+ *        and observability counters (`StackPoolStats`).
  */
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -27,43 +31,87 @@
 #include <unistd.h>
 #endif
 
-namespace gorun::detail {
+namespace gorun {
+
+/**
+ * @enum StackSize
+ * @brief Predefined stack size classes for launching green routines with `gorun::go(StackSize::Small, fn)`.
+ */
+enum class StackSize : std::size_t {
+    Small   = 16 * 1024,       ///< 16 KB  — lightweight tasks & high-density fan-out
+    Compact = 64 * 1024,       ///< 64 KB  — medium tasks & simple network handlers
+    Default = 128 * 1024,      ///< 128 KB — general-purpose handlers & I/O
+    Medium  = 256 * 1024,      ///< 256 KB — deeper call stacks / parsing
+    Large   = 512 * 1024,      ///< 512 KB — heavy recursion / large stack buffers
+    Huge    = 2 * 1024 * 1024  ///< 2 MB   — deep recursion or C library interop
+};
+
+/**
+ * @struct Options
+ * @brief Per-routine spawn configuration passed to `gorun::go(Options{.stack_size = ...}, fn)`.
+ */
+struct Options {
+    std::size_t stack_size{0}; ///< Requested usable stack size in bytes (`0` = Runtime's `default_stack_size`)
+};
+
+/**
+ * @struct StackPoolStats
+ * @brief Snapshot of virtual-memory stack pool allocations and cache reuse.
+ */
+struct StackPoolStats {
+    std::size_t pooled_stacks{0};           ///< Idle stacks currently cached across all size buckets
+    std::size_t pooled_bytes{0};            ///< Total usable stack bytes currently cached in pool
+    std::uint64_t total_allocated{0};       ///< Total OS `VirtualAlloc`/`mmap` stack allocations
+    std::uint64_t total_reused{0};          ///< Total pool cache hits (avoided OS syscalls)
+};
+
+namespace detail {
 
 /**
  * @struct StackAllocation
  * @brief Descriptor for an OS-allocated green routine stack with an inaccessible hardware Guard Page at the bottom.
  *
- * Guarantees the **Stack Stability** invariant: unlike Go's growable/relocatable stacks (which invalidate
- * interior pointers unless escape-analyzed to the heap), `gorun` allocates fixed virtual-memory stacks
- * that never move during the routine's lifetime. Taking pointers/references to stack variables across
- * suspension points (`yield`, `Channel::recv`, `Mutex::lock`) is 100% safe.
+ * Guarantees the **Stack Stability** invariant: fixed virtual-memory stacks never move during a routine's
+ * lifetime, so pointers/references to stack variables remain 100% valid across suspension points.
  */
 struct StackAllocation {
     void* base_allocation{nullptr}; ///< Base address returned by `VirtualAlloc` / `mmap` (starts with the Guard Page)
     std::size_t total_bytes{0};     ///< Total virtual memory region size in bytes (usable stack + guard page)
     void* stack_bottom{nullptr};    ///< Lowest usable stack address (immediately above the guard page)
-    void* stack_top{nullptr};       ///< Highest usable stack address (initial `RSP`; stack grows downward)
+    void* stack_top{nullptr};       ///< Highest usable stack address (initial `SP`; stack grows downward)
     std::size_t usable_bytes{0};    ///< Usable stack capacity in bytes
 };
 
 /**
  * @class StackPool
- * @brief Thread-safe recycling pool of routine stacks (`StackAllocation`).
+ * @brief Thread-safe multi-bucket recycling pool of routine stacks (`StackAllocation`).
  *
- * Avoids expensive `VirtualAlloc`/`VirtualFree` or `mmap`/`munmap` system calls on every `gorun::go(...)` spawn
- * by caching completed routine stacks in LIFO order.
+ * Maintains 8 power-of-two size-class buckets (16 KB, 32 KB, 64 KB, 128 KB, 256 KB, 512 KB, 1 MB, 2 MB)
+ * so applications mixing lightweight 16 KB routines and deep 512 KB routines both enjoy zero-syscall LIFO reuse.
  */
 class StackPool {
-    static constexpr std::size_t kMinStackBytes = 16 * 1024; ///< Minimum safe usable stack size (16 KB)
+    static constexpr std::size_t kMinStackBytes = 16 * 1024;
+    static constexpr std::size_t kBucketCount = 8;
+    static constexpr std::array<std::size_t, kBucketCount> kBucketSizes = {
+        16 * 1024,
+        32 * 1024,
+        64 * 1024,
+        128 * 1024,
+        256 * 1024,
+        512 * 1024,
+        1024 * 1024,
+        2048 * 1024
+    };
 
     std::size_t default_usable_size_;
     std::size_t max_pooled_;
     mutable std::mutex mutex_;
-    std::vector<StackAllocation> pool_;
+    std::array<std::vector<StackAllocation>, kBucketCount> buckets_{};
+    std::size_t pooled_total_{0};
+    std::size_t pooled_bytes_{0};
+    std::atomic<std::uint64_t> total_allocated_{0};
+    std::atomic<std::uint64_t> total_reused_{0};
 
-    /**
-     * @brief Queries the operating system virtual memory page size (typically 4096 bytes).
-     */
     static std::size_t page_size() noexcept {
 #if defined(_WIN32)
         SYSTEM_INFO si;
@@ -79,11 +127,16 @@ class StackPool {
         return (size + alignment - 1) & ~(alignment - 1);
     }
 
-    /**
-     * @brief Allocates a fresh stack from OS virtual memory and marks the lowest page as `PAGE_NOACCESS` / `PROT_NONE`.
-     * @param requested_usable Requested usable stack size in bytes (clamped to >= 16 KB, overflow-checked).
-     * @throws std::bad_alloc If OS virtual memory allocation fails or size overflows.
-     */
+    /// Maps a usable size to its bucket index, or `kBucketCount` if larger than 2 MB.
+    static std::size_t bucket_index_for(std::size_t usable_bytes) noexcept {
+        for (std::size_t i = 0; i < kBucketCount; ++i) {
+            if (usable_bytes <= kBucketSizes[i]) {
+                return i;
+            }
+        }
+        return kBucketCount;
+    }
+
     static StackAllocation os_allocate(std::size_t requested_usable) {
         const std::size_t pg = page_size();
         const std::size_t clamped = std::max(requested_usable, kMinStackBytes);
@@ -133,62 +186,97 @@ class StackPool {
     }
 
 public:
-    /**
-     * @brief Constructs a `StackPool`.
-     * @param default_usable_size Default usable stack size per routine in bytes (default: 128 KB, minimum 16 KB).
-     * @param max_pooled Maximum number of idle stacks retained in the pool before returning memory to the OS.
-     */
     explicit StackPool(std::size_t default_usable_size = 128 * 1024, std::size_t max_pooled = 1024)
-        : default_usable_size_(std::max(default_usable_size, kMinStackBytes))
+        : default_usable_size_(normalize_size(default_usable_size))
         , max_pooled_(max_pooled) {}
 
     ~StackPool() {
         std::lock_guard lock(mutex_);
-        for (const auto& s : pool_) {
-            os_deallocate(s);
+        for (auto& bucket : buckets_) {
+            for (const auto& s : bucket) {
+                os_deallocate(s);
+            }
+            bucket.clear();
         }
-        pool_.clear();
+        pooled_total_ = 0;
+        pooled_bytes_ = 0;
+    }
+
+    /// Normalizes a requested stack size into its rounded bucket size (or page-aligned custom size if > 2 MB).
+    [[nodiscard]] static std::size_t normalize_size(std::size_t requested) noexcept {
+        const std::size_t clamped = std::max(requested, kMinStackBytes);
+        const std::size_t idx = bucket_index_for(clamped);
+        if (idx < kBucketCount) {
+            return kBucketSizes[idx];
+        }
+        return align_up(clamped, page_size());
+    }
+
+    [[nodiscard]] std::size_t default_usable_size() const noexcept {
+        return default_usable_size_;
     }
 
     /**
-     * @brief Acquires a warm stack from the pool (LIFO) or allocates a new one from the OS.
-     * @return `StackAllocation` descriptor.
+     * @brief Acquires a warm stack matching `requested_bytes` (0 = default size) from the matching bucket,
+     *        or allocates a fresh guard-paged virtual-memory stack from the OS.
      */
-    StackAllocation acquire() {
-        {
+    StackAllocation acquire(std::size_t requested_bytes = 0) {
+        const std::size_t target = (requested_bytes == 0)
+            ? default_usable_size_
+            : normalize_size(requested_bytes);
+        const std::size_t idx = bucket_index_for(target);
+
+        if (idx < kBucketCount) {
             std::lock_guard lock(mutex_);
-            if (!pool_.empty()) {
-                StackAllocation s = pool_.back();
-                pool_.pop_back();
+            auto& bucket = buckets_[idx];
+            if (!bucket.empty()) {
+                StackAllocation s = bucket.back();
+                bucket.pop_back();
+                --pooled_total_;
+                pooled_bytes_ -= s.usable_bytes;
+                total_reused_.fetch_add(1, std::memory_order_relaxed);
                 return s;
             }
         }
-        return os_allocate(default_usable_size_);
+
+        StackAllocation alloc = os_allocate(target);
+        total_allocated_.fetch_add(1, std::memory_order_relaxed);
+        return alloc;
     }
 
     /**
-     * @brief Returns a finished routine's stack to the recycling pool.
-     * @param s Stack allocation descriptor to recycle.
+     * @brief Returns a finished routine's stack to its size-class bucket (or releases to OS if full/oversized).
      */
     void release(StackAllocation s) noexcept {
         if (!s.base_allocation) return;
-        {
+        const std::size_t idx = bucket_index_for(s.usable_bytes);
+        if (idx < kBucketCount && s.usable_bytes == kBucketSizes[idx]) {
             std::lock_guard lock(mutex_);
-            if (pool_.size() < max_pooled_) {
-                pool_.push_back(s);
+            if (pooled_total_ < max_pooled_) {
+                buckets_[idx].push_back(s);
+                ++pooled_total_;
+                pooled_bytes_ += s.usable_bytes;
                 return;
             }
         }
         os_deallocate(s);
     }
 
-    /**
-     * @brief Returns the current number of cached idle stacks in the pool.
-     */
     [[nodiscard]] std::size_t pooled_count() const noexcept {
         std::lock_guard lock(mutex_);
-        return pool_.size();
+        return pooled_total_;
+    }
+
+    [[nodiscard]] StackPoolStats stats() const noexcept {
+        std::lock_guard lock(mutex_);
+        return StackPoolStats{
+            .pooled_stacks = pooled_total_,
+            .pooled_bytes = pooled_bytes_,
+            .total_allocated = total_allocated_.load(std::memory_order_relaxed),
+            .total_reused = total_reused_.load(std::memory_order_relaxed)
+        };
     }
 };
 
-} // namespace gorun::detail
+} // namespace detail
+} // namespace gorun
