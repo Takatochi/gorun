@@ -191,10 +191,11 @@ public:
             runtime_.spawn_raw([this, f = std::forward<F>(fn)]() mutable {
                 TaskGroup* prev = detail::set_implicit_scope(this);
                 try {
+                    auto task = std::move(f);
                     if constexpr (std::is_invocable_v<std::decay_t<F>&, std::stop_token>) {
-                        std::invoke(f, stop_source_.get_token());
+                        std::invoke(task, stop_source_.get_token());
                     } else {
-                        std::invoke(f);
+                        std::invoke(task);
                     }
                 } catch (...) {
                     stop_source_.request_stop();
@@ -202,6 +203,10 @@ public:
                     if (!first_exception_) {
                         first_exception_ = std::current_exception();
                     }
+                }
+                // Destroy all RoutineLocal<T> instances strictly BEFORE wg_.done() unblocks ~Scope()/wait()!
+                if (detail::Routine* cur = detail::current_routine()) {
+                    cur->clear_locals();
                 }
                 detail::set_implicit_scope(prev);
                 wg_.done();
@@ -323,13 +328,17 @@ auto go_async(Options opts, F&& fn) -> JoinHandle<std::invoke_result_t<F>> {
     try {
         default_runtime().spawn_raw([state, f = std::forward<F>(fn)]() mutable {
             try {
+                auto task = std::move(f);
                 if constexpr (std::is_void_v<R>) {
-                    std::invoke(f);
+                    std::invoke(task);
                 } else {
-                    state->value.emplace(std::invoke(f));
+                    state->value.emplace(std::invoke(task));
                 }
             } catch (...) {
                 state->exception = std::current_exception();
+            }
+            if (detail::Routine* cur = detail::current_routine()) {
+                cur->clear_locals();
             }
             state->mark_ready();
         }, opts.stack_size);

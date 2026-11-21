@@ -1204,9 +1204,13 @@ auto Runtime::block_on(F&& fn) -> std::invoke_result_t<F> {
     if constexpr (std::is_void_v<R>) {
         spawn_raw([&, f = std::forward<F>(fn)]() mutable {
             try {
-                std::invoke(f);
+                auto task = std::move(f);
+                std::invoke(task);
             } catch (...) {
                 exc = std::current_exception();
+            }
+            if (detail::Routine* cur = detail::current_routine()) {
+                cur->clear_locals();
             }
             notify_done();
         });
@@ -1218,9 +1222,13 @@ auto Runtime::block_on(F&& fn) -> std::invoke_result_t<F> {
         std::optional<R> result;
         spawn_raw([&, f = std::forward<F>(fn)]() mutable {
             try {
-                result.emplace(std::invoke(f));
+                auto task = std::move(f);
+                result.emplace(std::invoke(task));
             } catch (...) {
                 exc = std::current_exception();
+            }
+            if (detail::Routine* cur = detail::current_routine()) {
+                cur->clear_locals();
             }
             notify_done();
         });
