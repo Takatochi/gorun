@@ -43,8 +43,11 @@ Copy either the single amalgamated header [`single_include/gorun/gorun.hpp`](./s
 # Compile directly with GCC / Clang / MinGW-w64 (modular headers):
 g++ -std=c++20 -O3 -pthread -Iinclude main.cpp -o my_app
 
-# Or compile against the single-header distribution:
+# Or compile against the single-header distribution (Linux/macOS):
 g++ -std=c++20 -O3 -pthread -Isingle_include main.cpp -o my_app
+
+# On Windows (MinGW/GCC) when using gorun::net sockets:
+g++ -std=c++20 -O3 -pthread -Isingle_include main.cpp -o my_app.exe -lws2_32 -lmswsock
 ```
 
 ### Option 3: Git Submodule + `add_subdirectory`

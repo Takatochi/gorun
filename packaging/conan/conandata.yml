@@ -1,0 +1,4 @@
+sources:
+  "0.4.0":
+    url: "https://github.com/Takatochi/gorun/archive/refs/tags/v0.4.0.tar.gz"
+    sha256: "263f8ab135edab62a3e87a71d8356562daeae016b1214a4121bba2aeacac1b8b"

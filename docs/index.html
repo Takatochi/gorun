@@ -635,7 +635,7 @@
         <div class="hero-links">
           <a class="btn btn-primary" href="#playground">Open Live C++20 Playground</a>
           <a class="btn btn-secondary" href="https://github.com/Takatochi/gorun">GitHub Repository</a>
-          <a class="btn btn-secondary" href="./gorun.hpp" download="gorun.hpp">Download Single Header</a>
+          <a class="btn btn-secondary" href="https://raw.githubusercontent.com/Takatochi/gorun/main/single_include/gorun/gorun.hpp" download="gorun.hpp">Download Single Header</a>
         </div>
       </div>
       <div class="hero-logo-box">
@@ -708,7 +708,7 @@
     <!-- INSTALLATION -->
     <section id="install">
       <h2>Quick Start &amp; Installation</h2>
-      <p>Because <code>gorun</code> is 100% header-only with zero external dependencies, add it via CMake <code>FetchContent</code> or drop in the single amalgamated header <a href="./gorun.hpp" style="color: var(--accent);">single_include/gorun/gorun.hpp</a>:</p>
+      <p>Because <code>gorun</code> is 100% header-only with zero external dependencies, add it via CMake <code>FetchContent</code> or drop in the single amalgamated header <a href="https://raw.githubusercontent.com/Takatochi/gorun/main/single_include/gorun/gorun.hpp" style="color: var(--accent);">single_include/gorun/gorun.hpp</a>:</p>
       <pre><code class="lang-cmake">include(FetchContent)
 
 FetchContent_Declare(
@@ -1398,7 +1398,6 @@ int main() {
     async function fetchGorunHeader() {
       if (cachedGorunHeader) return cachedGorunHeader;
       const urls = [
-        './gorun.hpp',
         'https://raw.githubusercontent.com/Takatochi/gorun/main/single_include/gorun/gorun.hpp'
       ];
       let lastErr = null;
