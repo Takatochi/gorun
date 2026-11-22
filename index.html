@@ -1,0 +1,1740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>gorun — C++20/23 M:N Green Threads, Channels &amp; Live C++20 Playground</title>
+  <link rel="icon" type="image/svg+xml" href="./logo.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:ital,wght@0,400;0,600;0,700;1,400&display=swap" rel="stylesheet" />
+  <!-- CodeMirror 5 for IntelliJ IDEA / CLion Darcula Live C++20 Editor -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/lib/codemirror.min.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/lib/codemirror.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/mode/clike/clike.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/addon/edit/matchbrackets.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/addon/edit/closebrackets.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/addon/selection/active-line.min.js"></script>
+  <style>
+    :root {
+      --bg-primary: #0b0f17;
+      --bg-secondary: #111827;
+      --bg-card: #161f33;
+      --bg-code: #2b2b2b;
+      --bg-gutter: #313335;
+      --text-primary: #f3f4f6;
+      --text-secondary: #9ca3af;
+      --accent: #38bdf8;
+      --accent-glow: rgba(56, 189, 248, 0.18);
+      --green: #34d399;
+      --red: #f87171;
+      --amber: #fbbf24;
+      --purple: #a78bfa;
+      --border: #1f2937;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+
+      /* JetBrains IntelliJ IDEA / CLion Darcula Palette */
+      --idea-bg: #2b2b2b;
+      --idea-gutter: #313335;
+      --idea-border: #3c3f41;
+      --idea-active-line: #323232;
+      --idea-selection: #214283;
+      --idea-text: #a9b7c6;
+      --idea-keyword: #cc7832;
+      --idea-string: #6a8759;
+      --idea-number: #6897bb;
+      --idea-comment: #808080;
+      --idea-function: #ffc66d;
+      --idea-type: #4ec9b0;
+      --idea-macro: #bbb529;
+      --idea-namespace: #9876aa;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: var(--font-sans);
+      background-color: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.65;
+      display: flex;
+      min-height: 100vh;
+    }
+
+    /* Sidebar Navigation */
+    aside.sidebar {
+      width: 280px;
+      background-color: var(--bg-secondary);
+      border-right: 1px solid var(--border);
+      position: fixed;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      overflow-y: auto;
+      padding: 1.5rem 1.25rem;
+      z-index: 100;
+    }
+    .brand {
+      font-size: 1.5rem;
+      font-weight: 800;
+      color: var(--accent);
+      letter-spacing: -0.03em;
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+      margin-bottom: 0.4rem;
+    }
+    .brand img {
+      width: 42px;
+      height: 42px;
+      border-radius: 10px;
+      object-fit: cover;
+      border: 1px solid rgba(56, 189, 248, 0.4);
+    }
+    .brand-sub {
+      font-size: 0.78rem;
+      color: var(--text-secondary);
+      margin-bottom: 1.25rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 0.9rem;
+    }
+    .nav-section {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-secondary);
+      margin: 1.15rem 0 0.45rem 0;
+      font-weight: 700;
+    }
+    .nav-list { list-style: none; }
+    .nav-list li { margin-bottom: 0.22rem; }
+    .nav-list a {
+      display: block;
+      padding: 0.38rem 0.65rem;
+      border-radius: 6px;
+      color: var(--text-primary);
+      text-decoration: none;
+      font-size: 0.87rem;
+      transition: background 0.15s, color 0.15s;
+    }
+    .nav-list a:hover {
+      background-color: var(--accent-glow);
+      color: var(--accent);
+    }
+
+    /* Main Content */
+    main.content {
+      margin-left: 280px;
+      flex: 1;
+      max-width: 1200px;
+      padding: 2.5rem 3.25rem 5rem 3.25rem;
+    }
+
+    /* Hero Header */
+    .hero {
+      background: linear-gradient(135deg, rgba(56,189,248,0.12) 0%, rgba(17,24,39,0.75) 100%);
+      border: 1px solid rgba(56,189,248,0.3);
+      border-radius: 14px;
+      padding: 2.25rem;
+      margin-bottom: 2.75rem;
+      display: flex;
+      gap: 2rem;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .hero-left { flex: 1; }
+    .hero-logo-box {
+      width: 150px;
+      height: 150px;
+      flex-shrink: 0;
+      border-radius: 22px;
+      overflow: hidden;
+      border: 2px solid rgba(56, 189, 248, 0.45);
+      box-shadow: 0 0 32px rgba(56, 189, 248, 0.22);
+      background-color: #0d1321;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .hero-logo-box img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-bottom: 0.85rem;
+    }
+    .badge {
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 0.25rem 0.65rem;
+      border-radius: 999px;
+      background-color: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--accent);
+    }
+    .hero h1 {
+      font-size: 2.2rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-bottom: 0.65rem;
+    }
+    .hero p {
+      color: var(--text-secondary);
+      font-size: 1.02rem;
+      max-width: 760px;
+      margin-bottom: 1.35rem;
+    }
+    .hero-links {
+      display: flex;
+      gap: 0.85rem;
+      flex-wrap: wrap;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.6rem 1.25rem;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 0.9rem;
+      text-decoration: none;
+      cursor: pointer;
+      border: none;
+      transition: transform 0.1s, opacity 0.15s;
+      font-family: var(--font-sans);
+    }
+    .btn:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
+    .btn-primary {
+      background-color: var(--accent);
+      color: #0b0f17;
+    }
+    .btn-run {
+      background: linear-gradient(90deg, #34d399, #38bdf8);
+      color: #0b0f17;
+      font-weight: 700;
+    }
+    .btn-secondary {
+      background-color: var(--bg-card);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+    }
+    .btn:hover:not(:disabled) { opacity: 0.92; transform: translateY(-1px); }
+
+    /* Interactive IDEA Darcula Playground */
+    .playground-shell {
+      background-color: #2b2b2b;
+      border: 1px solid #3c3f41;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55);
+      margin: 1.25rem 0 2.5rem 0;
+    }
+    .playground-toolbar {
+      background-color: #3c3f41;
+      border-bottom: 1px solid #26282a;
+      padding: 0.65rem 1rem;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.65rem;
+    }
+    .playground-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+    }
+    .tab-btn {
+      background-color: #2b2b2b;
+      color: #afb1b3;
+      border: 1px solid #4e5254;
+      padding: 0.38rem 0.72rem;
+      border-radius: 5px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+      font-family: var(--font-sans);
+    }
+    .tab-btn:hover {
+      color: #ffffff;
+      border-color: #4b6eaf;
+    }
+    .tab-btn.active {
+      background-color: #4e5254;
+      color: #ffffff;
+      border-color: #4b6eaf;
+      box-shadow: inset 0 -2px 0 #4a88c7;
+    }
+    .playground-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      align-items: center;
+    }
+    .compiler-select {
+      background-color: #2b2b2b;
+      color: #a9b7c6;
+      border: 1px solid #4e5254;
+      border-radius: 6px;
+      padding: 0.38rem 0.6rem;
+      font-size: 0.78rem;
+      font-family: var(--font-mono);
+      outline: none;
+    }
+    .playground-body {
+      display: grid;
+      grid-template-columns: 1.32fr 0.88fr;
+      min-height: 470px;
+    }
+    .editor-pane {
+      border-right: 1px solid #3c3f41;
+      display: flex;
+      flex-direction: column;
+      background-color: var(--idea-bg);
+      min-width: 0;
+    }
+    .pane-header {
+      background-color: #313335;
+      padding: 0.42rem 0.9rem;
+      font-size: 0.75rem;
+      font-family: var(--font-mono);
+      color: #a9b7c6;
+      border-bottom: 1px solid #26282a;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .editor-wrapper {
+      flex: 1;
+      position: relative;
+      min-height: 430px;
+      background-color: var(--idea-bg);
+    }
+    textarea#pg-editor {
+      width: 100%;
+      height: 100%;
+      min-height: 430px;
+      background-color: var(--idea-bg);
+      color: var(--idea-text);
+      border: none;
+      outline: none;
+      resize: none;
+      padding: 0.85rem 1rem;
+      font-family: var(--font-mono);
+      font-size: 0.83rem;
+      line-height: 1.55;
+      tab-size: 4;
+    }
+
+    /* JetBrains IntelliJ IDEA / CLion Darcula Theme for CodeMirror */
+    .cm-s-idea-darcula.CodeMirror {
+      height: 460px;
+      background-color: var(--idea-bg);
+      color: var(--idea-text);
+      font-family: var(--font-mono);
+      font-size: 0.83rem;
+      line-height: 1.58;
+    }
+    .cm-s-idea-darcula .CodeMirror-gutters {
+      background-color: var(--idea-gutter);
+      border-right: 1px solid #3c3f41;
+    }
+    .cm-s-idea-darcula .CodeMirror-linenumber {
+      color: #606366;
+      padding: 0 8px 0 6px;
+    }
+    .cm-s-idea-darcula .CodeMirror-cursor {
+      border-left: 2px solid #bbbbbb;
+    }
+    .cm-s-idea-darcula .CodeMirror-activeline-background {
+      background: var(--idea-active-line);
+    }
+    .cm-s-idea-darcula div.CodeMirror-selected {
+      background: var(--idea-selection);
+    }
+    .cm-s-idea-darcula .CodeMirror-matchingbracket {
+      background-color: #3b514d;
+      color: #ffef28 !important;
+      font-weight: 700;
+    }
+    .cm-s-idea-darcula span.cm-keyword { color: var(--idea-keyword); font-weight: 600; }
+    .cm-s-idea-darcula span.cm-type { color: var(--idea-keyword); font-weight: 600; }
+    .cm-s-idea-darcula span.cm-atom { color: var(--idea-keyword); font-weight: 600; }
+    .cm-s-idea-darcula span.cm-meta { color: var(--idea-macro); }
+    .cm-s-idea-darcula span.cm-string { color: var(--idea-string); }
+    .cm-s-idea-darcula span.cm-string-2 { color: var(--idea-string); }
+    .cm-s-idea-darcula span.cm-number { color: var(--idea-number); }
+    .cm-s-idea-darcula span.cm-comment { color: var(--idea-comment); font-style: italic; }
+    .cm-s-idea-darcula span.cm-def { color: var(--idea-function); }
+    .cm-s-idea-darcula span.cm-variable { color: var(--idea-text); }
+    .cm-s-idea-darcula span.cm-variable-2 { color: var(--idea-text); }
+    .cm-s-idea-darcula span.cm-variable-3 { color: var(--idea-type); }
+    .cm-s-idea-darcula span.cm-property { color: var(--idea-function); }
+    .cm-s-idea-darcula span.cm-operator { color: var(--idea-text); }
+    .cm-s-idea-darcula span.cm-builtin { color: var(--idea-type); }
+    .cm-s-idea-darcula span.cm-qualifier { color: var(--idea-keyword); }
+
+    /* Static C++ Code Blocks Darcula Highlighting Classes */
+    .tok-kw { color: var(--idea-keyword); font-weight: 600; }
+    .tok-str { color: var(--idea-string); }
+    .tok-num { color: var(--idea-number); }
+    .tok-cmt { color: var(--idea-comment); font-style: italic; }
+    .tok-mac { color: var(--idea-macro); }
+    .tok-fn { color: var(--idea-function); }
+    .tok-ty { color: var(--idea-type); }
+    .tok-ns { color: var(--idea-namespace); }
+
+    .output-pane {
+      display: flex;
+      flex-direction: column;
+      background-color: #1e1f22;
+      min-width: 0;
+    }
+    .console-box {
+      flex: 1;
+      height: 460px;
+      padding: 0.9rem 1.05rem;
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      line-height: 1.55;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #d1d5db;
+    }
+    .console-line-info { color: var(--accent); }
+    .console-line-ok { color: var(--green); }
+    .console-line-warn { color: var(--amber); }
+    .console-line-err { color: var(--red); }
+    .console-line-sched { color: var(--purple); font-size: 0.76rem; }
+    .console-line-stdout { color: #e5e7eb; }
+    .scheduler-visualizer {
+      border-top: 1px solid #26282a;
+      background-color: #313335;
+      padding: 0.58rem 1rem;
+      font-size: 0.75rem;
+      font-family: var(--font-mono);
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+    .stat-pill {
+      background-color: #2b2b2b;
+      border: 1px solid #4e5254;
+      padding: 0.2rem 0.6rem;
+      border-radius: 4px;
+      color: #a9b7c6;
+    }
+    .stat-pill strong { color: var(--green); }
+
+    /* Sections */
+    section {
+      margin-bottom: 3.5rem;
+      scroll-margin-top: 2rem;
+    }
+    h2 {
+      font-size: 1.65rem;
+      font-weight: 700;
+      margin-bottom: 1rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text-primary);
+    }
+    h3 {
+      font-size: 1.2rem;
+      font-weight: 600;
+      margin: 1.5rem 0 0.65rem 0;
+      color: var(--accent);
+    }
+    p { margin-bottom: 1rem; color: #d1d5db; }
+
+    /* Cards & Grids */
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+      gap: 1.25rem;
+      margin: 1.25rem 0;
+    }
+    .card {
+      background-color: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.35rem;
+    }
+    .card h4 {
+      font-size: 1.02rem;
+      margin-bottom: 0.5rem;
+      color: var(--text-primary);
+    }
+    .card-do { border-left: 4px solid var(--green); }
+    .card-dont { border-left: 4px solid var(--red); }
+
+    /* Code Blocks (Darcula Styled) */
+    pre {
+      background-color: var(--idea-bg);
+      border: 1px solid #3c3f41;
+      border-radius: 8px;
+      padding: 1.1rem 1.25rem;
+      overflow-x: auto;
+      font-family: var(--font-mono);
+      font-size: 0.83rem;
+      line-height: 1.55;
+      margin: 0.85rem 0 1.25rem 0;
+      color: var(--idea-text);
+    }
+    code {
+      font-family: var(--font-mono);
+      background-color: rgba(255,255,255,0.07);
+      padding: 0.15rem 0.4rem;
+      border-radius: 4px;
+      font-size: 0.85em;
+      color: var(--accent);
+    }
+    pre code {
+      background: none;
+      padding: 0;
+      color: inherit;
+    }
+
+    /* Tables */
+    .table-wrap { overflow-x: auto; margin: 1.25rem 0; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background-color: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 0.88rem;
+    }
+    th, td {
+      padding: 0.75rem 1rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      background-color: var(--bg-card);
+      color: var(--accent);
+      font-weight: 600;
+    }
+    tr:hover td { background-color: rgba(255,255,255,0.02); }
+
+    /* Benchmark Bar Charts */
+    .bench-row { margin-bottom: 1.1rem; }
+    .bench-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.86rem;
+      margin-bottom: 0.3rem;
+      font-family: var(--font-mono);
+    }
+    .bar-track {
+      width: 100%;
+      background-color: #0d1321;
+      height: 22px;
+      border-radius: 6px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    .bar-fill-gorun {
+      height: 100%;
+      background: linear-gradient(90deg, #38bdf8, #34d399);
+    }
+    .bar-fill-go {
+      height: 100%;
+      background: #6366f1;
+    }
+    .bar-fill-std {
+      height: 100%;
+      background: #f87171;
+    }
+
+    footer {
+      margin-top: 4rem;
+      padding-top: 2rem;
+      border-top: 1px solid var(--border);
+      color: var(--text-secondary);
+      font-size: 0.85rem;
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+    }
+
+    @media (max-width: 960px) {
+      aside.sidebar { display: none; }
+      main.content { margin-left: 0; padding: 1.5rem; }
+      .playground-body { grid-template-columns: 1fr; }
+      .hero { flex-direction: column-reverse; text-align: left; }
+    }
+  </style>
+</head>
+<body>
+
+  <aside class="sidebar">
+    <div class="brand">
+      <img src="./logo.png" onerror="this.src='./logo.svg'" alt="gorun logo" />
+      <span>gorun</span>
+    </div>
+    <div class="brand-sub">C++20/23 M:N Green Threads &amp; Channels Runtime<br/>By Artur Havor</div>
+
+    <div class="nav-section">Interactive</div>
+    <ul class="nav-list">
+      <li><a href="#playground">Live C++20 Playground</a></li>
+      <li><a href="#install">Quick Installation</a></li>
+      <li><a href="#invariants">Core Invariants</a></li>
+    </ul>
+
+    <div class="nav-section">Pointer &amp; Memory Safety</div>
+    <ul class="nav-list">
+      <li><a href="#pointers">4-Layer Pointer Safety</a></li>
+      <li><a href="#arenas">Memory Arenas &amp; unique_ptr Slabs</a></li>
+    </ul>
+
+    <div class="nav-section">The One-Way Guide (DO / DONT)</div>
+    <ul class="nav-list">
+      <li><a href="#rule-go">1. go(), Scope &amp; TaskGroup</a></li>
+      <li><a href="#rule-channel">2. Channel&lt;T&gt; &amp; select()</a></li>
+      <li><a href="#rule-sync">3. Mutex, RwMutex &amp; WaitGroup</a></li>
+      <li><a href="#rule-context">4. Go-Style Context</a></li>
+      <li><a href="#rule-defer">5. GORUN_DEFER &amp; Rollbacks</a></li>
+      <li><a href="#rule-tls">6. RoutineLocal vs thread_local</a></li>
+    </ul>
+
+    <div class="nav-section">Benchmarks &amp; Ecosystem</div>
+    <ul class="nav-list">
+      <li><a href="#benchmarks">gorun vs Go 1.27 vs std::jthread</a></li>
+      <li><a href="#comparison">vs Boost.Fiber &amp; C++20 co_await</a></li>
+      <li><a href="#tests">25 Verification Test Suites</a></li>
+    </ul>
+  </aside>
+
+  <main class="content">
+
+    <!-- HERO -->
+    <div class="hero">
+      <div class="hero-left">
+        <div class="badges">
+          <span class="badge">Version: v0.4.0</span>
+          <span class="badge">C++20 / C++23</span>
+          <span class="badge">x86_64 &amp; ARM64 | IOCP / epoll / kqueue</span>
+          <span class="badge">Apache-2.0 License</span>
+        </div>
+        <h1>gorun — Go's M:N Concurrency Model for Modern C++</h1>
+        <p>
+          Ultra-fast stackful green threads (~65 ns user-space context switch), zero-allocation stack-to-stack
+          <code>Channel&lt;T&gt;</code>, true parked <code>select(...)</code> multiplexing, cascading <code>gorun::Context</code>,
+          <code>GORUN_DEFER</code>, and RAII structured concurrency (<code>gorun::Scope</code>).
+        </p>
+        <div class="hero-links">
+          <a class="btn btn-primary" href="#playground">Open Live C++20 Playground</a>
+          <a class="btn btn-secondary" href="https://github.com/Takatochi/gorun">GitHub Repository</a>
+          <a class="btn btn-secondary" href="https://raw.githubusercontent.com/Takatochi/gorun/main/single_include/gorun/gorun.hpp" download="gorun.hpp">Download Single Header</a>
+        </div>
+      </div>
+      <div class="hero-logo-box">
+        <img src="./logo.png" onerror="this.src='./logo.svg'" alt="gorun emblem" />
+      </div>
+    </div>
+
+    <!-- INTERACTIVE LIVE C++20 PLAYGROUND -->
+    <section id="playground">
+      <h2>Live C++20 Playground (IntelliJ IDEA / CLion Darcula + Real GCC 14.2 Execution)</h2>
+      <p>
+        Edit any example below or switch to <strong>06. Custom Sandbox</strong> to write your own C++20 code using
+        <code>#include "gorun/gorun.hpp"</code>. Click <strong>Run Live C++20 (GCC 14.2)</strong> (or press
+        <code>Ctrl+Enter</code>) to compile and execute your code live on real Linux x86_64 GCC via Compiler Explorer
+        with the amalgamated <code>gorun.hpp</code> header bundled automatically.
+      </p>
+
+      <div class="playground-shell">
+        <div class="playground-toolbar">
+          <div class="playground-tabs">
+            <button class="tab-btn active" onclick="loadExample(0)">01. Channels &amp; select()</button>
+            <button class="tab-btn" onclick="loadExample(1)">02. Scope &amp; Defer</button>
+            <button class="tab-btn" onclick="loadExample(2)">03. Web Context &amp; SLA</button>
+            <button class="tab-btn" onclick="loadExample(3)">04. RwMutex &amp; JoinHandle</button>
+            <button class="tab-btn" onclick="loadExample(4)">05. Arenas &amp; Pointers</button>
+            <button class="tab-btn" onclick="loadExample(5)">06. Custom Sandbox</button>
+          </div>
+          <div class="playground-actions">
+            <select id="pg-flags" class="compiler-select" title="Compiler Flags">
+              <option value="-std=c++20 -O2 -pthread">GCC 14.2 (-std=c++20 -O2)</option>
+              <option value="-std=c++23 -O3 -pthread">GCC 14.2 (-std=c++23 -O3)</option>
+              <option value="-std=c++20 -O2 -Wall -Wextra -pthread">GCC 14.2 (-Wall -Wextra)</option>
+            </select>
+            <button class="btn btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.78rem;" onclick="resetExample()">Reset</button>
+            <button class="btn btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.78rem;" onclick="copyCode()">Copy</button>
+            <button class="btn btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.78rem;" onclick="runTracePreview()">Trace Preview</button>
+            <button id="pg-run-btn" class="btn btn-run" style="padding: 0.42rem 0.95rem; font-size: 0.82rem;" onclick="runLiveCompiler()">&#9654; Run Live C++20</button>
+          </div>
+        </div>
+
+        <div class="playground-body">
+          <div class="editor-pane">
+            <div class="pane-header">
+              <span id="pg-filename">examples/01_channels_and_select.cpp</span>
+              <span>IDEA Darcula &bull; Ctrl+Enter to Run</span>
+            </div>
+            <div class="editor-wrapper">
+              <textarea id="pg-editor" spellcheck="false"></textarea>
+            </div>
+          </div>
+
+          <div class="output-pane">
+            <div class="pane-header">
+              <span id="pg-output-title">Compiler &amp; Runtime Console</span>
+              <span id="pg-status" style="color: var(--green);">Ready</span>
+            </div>
+            <div class="console-box" id="pg-console">Click "Run Live C++20" (Ctrl+Enter) to compile and execute your code with real GCC 14.2, or click "Trace Preview" for an instant M:N scheduler trace.</div>
+          </div>
+        </div>
+
+        <div class="scheduler-visualizer">
+          <div class="stat-pill">Backend: <strong id="stat-backend">GCC 14.2 (x86_64 Linux)</strong></div>
+          <div class="stat-pill">Header: <strong id="stat-header">gorun.hpp (14 inlined)</strong></div>
+          <div class="stat-pill">Exec Time: <strong id="stat-time">--</strong></div>
+          <div class="stat-pill">Exit Code: <strong id="stat-exit">--</strong></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- INSTALLATION -->
+    <section id="install">
+      <h2>Quick Start &amp; Installation (6 Integration Methods)</h2>
+      <p>Because <code>gorun</code> is 100% header-only with zero external dependencies (Linux x86_64/ARM64, macOS Apple Silicon/Intel, Windows x64), choose whichever workflow fits your project:</p>
+      <div class="playground-tabs" style="margin-bottom: 0.9rem;">
+        <button class="tab-btn install-tab active" onclick="switchInstallTab(0)">1. CMake FetchContent</button>
+        <button class="tab-btn install-tab" onclick="switchInstallTab(1)">2. Single-Header</button>
+        <button class="tab-btn install-tab" onclick="switchInstallTab(2)">3. Git Submodule</button>
+        <button class="tab-btn install-tab" onclick="switchInstallTab(3)">4. CMake Install</button>
+        <button class="tab-btn install-tab" onclick="switchInstallTab(4)">5. vcpkg</button>
+        <button class="tab-btn install-tab" onclick="switchInstallTab(5)">6. Conan 2.0</button>
+      </div>
+
+      <div class="install-panel" data-install="0">
+        <p><strong>Recommended for CMake projects</strong> &mdash; zero manual downloads; automatically configures C++20, <code>-pthread</code>, and Windows Winsock (<code>ws2_32</code>/<code>mswsock</code>):</p>
+        <pre><code class="lang-cmake">cmake_minimum_required(VERSION 3.20)
+project(my_app LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+
+include(FetchContent)
+FetchContent_Declare(
+    gorun
+    GIT_REPOSITORY https://github.com/Takatochi/gorun.git
+    GIT_TAG        v0.4.0
+)
+FetchContent_MakeAvailable(gorun)
+
+add_executable(my_app main.cpp)
+target_link_libraries(my_app PRIVATE gorun::gorun)</code></pre>
+      </div>
+
+      <div class="install-panel" data-install="1" style="display:none;">
+        <p>Download the single amalgamated header <a href="https://raw.githubusercontent.com/Takatochi/gorun/v0.4.0/single_include/gorun/gorun.hpp" style="color: var(--accent);">single_include/gorun/gorun.hpp</a> and compile directly (no CMake required):</p>
+        <pre><code>mkdir -p include/gorun
+curl -fLo include/gorun/gorun.hpp \
+  https://raw.githubusercontent.com/Takatochi/gorun/v0.4.0/single_include/gorun/gorun.hpp
+
+# Linux / macOS (GCC or Clang):
+g++ -std=c++20 -O3 -pthread -Iinclude main.cpp -o my_app
+
+# Windows MinGW / GCC (when using gorun::net sockets):
+g++ -std=c++20 -O3 -pthread -Iinclude main.cpp -o my_app.exe -lws2_32 -lmswsock
+
+# Windows MSVC:
+cl /std:c++20 /O2 /EHsc /Iinclude main.cpp ws2_32.lib mswsock.lib</code></pre>
+      </div>
+
+      <div class="install-panel" data-install="2" style="display:none;">
+        <p>Vendor <code>gorun</code> directly in your repository for offline or air-gapped builds:</p>
+        <pre><code>git submodule add https://github.com/Takatochi/gorun.git external/gorun
+git -C external/gorun checkout v0.4.0</code></pre>
+        <pre><code class="lang-cmake">add_subdirectory(external/gorun)
+target_link_libraries(my_app PRIVATE gorun::gorun)</code></pre>
+      </div>
+
+      <div class="install-panel" data-install="3" style="display:none;">
+        <p>Install once into a system or custom prefix and reuse across projects with <code>find_package</code>:</p>
+        <pre><code>git clone --branch v0.4.0 https://github.com/Takatochi/gorun.git
+cmake -S gorun -B gorun/build -DCMAKE_BUILD_TYPE=Release \
+  -DGORUN_BUILD_TESTS=OFF -DGORUN_BUILD_EXAMPLES=OFF -DGORUN_BUILD_BENCHMARKS=OFF
+cmake --install gorun/build --prefix /usr/local</code></pre>
+        <pre><code class="lang-cmake">find_package(gorun 0.4.0 REQUIRED CONFIG)
+target_link_libraries(my_app PRIVATE gorun::gorun)</code></pre>
+      </div>
+
+      <div class="install-panel" data-install="4" style="display:none;">
+        <p>Use the bundled <code>vcpkg</code> overlay port (verified <code>v0.4.0</code> SHA512 in <code>packaging/vcpkg/</code>):</p>
+        <pre><code>git clone https://github.com/Takatochi/gorun.git
+vcpkg install gorun --overlay-ports=./gorun/packaging/vcpkg</code></pre>
+        <pre><code class="lang-cmake">find_package(gorun CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE gorun::gorun)</code></pre>
+      </div>
+
+      <div class="install-panel" data-install="5" style="display:none;">
+        <p>Build into your local Conan 2.0 cache using <code>packaging/conan/</code> (verified <code>v0.4.0</code> SHA256):</p>
+        <pre><code>git clone https://github.com/Takatochi/gorun.git
+conan create gorun/packaging/conan --version=0.4.0 --build=missing</code></pre>
+        <pre><code># conanfile.txt
+[requires]
+gorun/0.4.0
+
+[generators]
+CMakeDeps
+CMakeToolchain</code></pre>
+      </div>
+      <script>
+        function switchInstallTab(idx) {
+          document.querySelectorAll('.install-tab').forEach((b, i) => b.classList.toggle('active', i === idx));
+          document.querySelectorAll('.install-panel').forEach((p, i) => p.style.display = (i === idx) ? '' : 'none');
+        }
+      </script>
+    </section>
+
+    <!-- INVARIANTS -->
+    <section id="invariants">
+      <h2>Core Architectural Invariants</h2>
+      <div class="grid-2">
+        <div class="card">
+          <h4>1. Zero OS-Thread Blocking</h4>
+          <p><code>Channel&lt;T&gt;</code>, <code>Mutex</code>, <code>CondVar</code>, <code>WaitGroup</code>, <code>Semaphore</code>, <code>RwMutex</code>, <code>select()</code>, and <code>sleep_for</code> never block the underlying <code>std::jthread</code> worker. They park the green routine in ~65 ns and immediately execute the next runnable routine.</p>
+        </div>
+        <div class="card">
+          <h4>2. Stack Stability Invariant</h4>
+          <p>Unlike Go (which reallocates and copies 2 KB stacks when they grow, invalidating pointers), <code>gorun</code> allocates fixed 128 KB virtual stacks with a 4 KB hardware <code>PAGE_NOACCESS</code> Guard Page. Stack addresses never move.</p>
+        </div>
+        <div class="card">
+          <h4>3. Structured Concurrency by Default</h4>
+          <p><code>gorun::Scope</code> and <code>gorun::TaskGroup</code> automatically attach any inner <code>gorun::go([&amp;]{ ... })</code> calls (including transitively nested ones) and join them in <code>~Scope()</code>, preventing dangling <code>[&amp;]</code> references.</p>
+        </div>
+        <div class="card">
+          <h4>4. Deterministic Exception, FPU &amp; Pointer Safety</h4>
+          <p>Full GPR, XMM6-XMM15, <code>MXCSR</code>, and x87 FPU control word preservation across switches; move-only lambda support via SBO <code>UniqueTask</code>; zero-leak <code>RoutineLocal&lt;T&gt;</code> and cancellable timers.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- POINTERS & MEMORY ARENAS -->
+    <section id="pointers">
+      <h2>4-Layer Pointer Safety &amp; Advanced Memory Allocation</h2>
+      <p>How <code>gorun</code> guarantees zero lost pointers, zero dangling stack pointers, and zero memory leaks across 16+ OS worker threads (verified by <code>[TEST 20]</code> auditing 10,500 heap objects and <code>[TEST 24]</code> auditing <code>RoutineLocal&lt;T&gt;</code>):</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Pointer Category</th>
+              <th>What Fails in Naive Runtimes / Go</th>
+              <th>How <code>gorun</code> Guarantees Safety</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>1. Raw Stack Pointers (<code>&amp;local_var</code>)</strong></td>
+              <td>Go copies &amp; relocates growing 2 KB stacks, breaking interior pointers.</td>
+              <td><strong>Fixed Virtual Stacks (<code>StackPool</code>):</strong> 128 KB + 4 KB Guard Page (clamped &gt;= 16 KB with overflow guard). Stack addresses never move.</td>
+            </tr>
+            <tr>
+              <td><strong>2. <code>Routine*</code> in <code>run_next_</code></strong></td>
+              <td>Unlocked <code>run_next_</code> slots can strand routines when a worker runs a long task.</td>
+              <td><strong>Stealable <code>run_next_</code> inside <code>WorkStealingDeque</code>:</strong> Idle thieves steal directly from both the FIFO ring buffer and <code>run_next_</code>.</td>
+            </tr>
+            <tr>
+              <td><strong>3. <code>thread_local</code> on <code>-O3</code></strong></td>
+              <td>GCC/Clang cache <code>thread_local</code> pointers in registers (<code>%rbx</code>) across function calls.</td>
+              <td><strong>Compiler TLS Barrier:</strong> <code>noinline</code> + <code>atomic_signal_fence</code> on <code>context_switch</code> forces fresh <code>%gs/%fs</code> reads after migration.</td>
+            </tr>
+            <tr>
+              <td><strong>4. Closures &amp; <code>RoutineLocal&lt;T&gt;</code></strong></td>
+              <td>Pooled fibers retain closures or leak per-routine TLS maps until process exit.</td>
+              <td><strong>Immediate Reset:</strong> <code>routine_trampoline</code> runs <code>r-&gt;task = nullptr; r-&gt;clear_locals();</code> before recycling the routine.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="arenas">Large-Scale Memory Patterns (From <code>examples/05_memory_arenas_and_pointers.cpp</code>)</h3>
+      <pre><code class="lang-cpp">// 1. Move-only 256-byte PacketSlab transferred across 3 channel stages with ZERO copies:
+gorun::Channel&lt;std::unique_ptr&lt;PacketSlab&gt;&gt; ingest_ch(16);
+
+gorun::go([&amp;]() {
+    GORUN_DEFER { ingest_ch.close(); };
+    for (uint64_t id = 1; id &lt;= 200; ++id) {
+        auto slab = std::make_unique&lt;PacketSlab&gt;(id);
+        ingest_ch.send(std::move(slab)); // Direct stack-to-stack pointer handoff!
+    }
+});
+
+// 2. Per-Routine Linear Bump Arena with O(1) bulk deallocation on routine exit:
+gorun::go([&amp;]() {
+    LinearArena arena(16 * 1024); // 16 KB contiguous arena
+    GORUN_DEFER { arena.reset(); }; // Instant O(1) cleanup even on exception!
+
+    HttpHeaderNode* head = nullptr;
+    for (int h = 0; h &lt; 50; ++h) {
+        head = arena.create&lt;HttpHeaderNode&gt;(h, "X-Gorun", "Zero-Copy", head);
+    }
+    gorun::yield(); // Migrates to another OS core — all arena pointers remain 100% valid!
+});</code></pre>
+    </section>
+
+    <!-- THE ONE-WAY GUIDE -->
+    <section id="rule-go">
+      <h2>Complete Tool-by-Tool Reference &amp; "The One-Way Rules"</h2>
+
+      <h3>1. <code>gorun::go(...)</code>, <code>gorun::Scope</code>, and <code>gorun::TaskGroup</code></h3>
+      <div class="grid-2">
+        <div class="card card-do">
+          <h4>DO (The One Way)</h4>
+          <p>Always declare <code>gorun::Scope scope;</code> before capturing local stack variables by reference <code>[&amp;]</code> in <code>gorun::go([&amp;]{ ... })</code>. Move-only lambdas capturing <code>std::unique_ptr</code> are natively supported via <code>UniqueTask</code>.</p>
+        </div>
+        <div class="card card-dont">
+          <h4>DON'T (Forbidden)</h4>
+          <p>NEVER capture local stack variables by reference <code>[&amp;]</code> in a detached <code>gorun::go(...)</code> that outlives the enclosing function frame.</p>
+        </div>
+      </div>
+
+      <h3 id="rule-channel">2. <code>gorun::Channel&lt;T&gt;</code> &amp; <code>gorun::select(...)</code></h3>
+      <div class="grid-2">
+        <div class="card card-do">
+          <h4>DO (The One Way)</h4>
+          <p>Always close producer channels with <code>GORUN_DEFER { ch.close(); };</code> so receivers iterating with <code>while (auto v = ch.recv())</code> terminate cleanly. <code>gorun::select(...)</code> uses true parked waiting (zero busy-spin) with deadlock-free sorted lock acquisition.</p>
+        </div>
+        <div class="card card-dont">
+          <h4>DON'T (Forbidden)</h4>
+          <p>NEVER destroy a <code>Channel&lt;T&gt;</code> while a detached routine still holds a reference to it. Use <code>std::shared_ptr&lt;Channel&lt;T&gt;&gt;</code> if the channel is shared across detached tasks.</p>
+        </div>
+      </div>
+
+      <h3 id="rule-sync">3. <code>gorun::Mutex</code>, <code>RwMutex</code>, <code>CondVar</code>, <code>WaitGroup</code>, <code>Semaphore</code>, <code>Once</code></h3>
+      <div class="grid-2">
+        <div class="card card-do">
+          <h4>DO (The One Way)</h4>
+          <p>Always use <code>gorun::Mutex</code> (with <code>std::lock_guard</code> / <code>std::unique_lock</code>), <code>gorun::RwMutex</code> (with <code>std::shared_lock</code>), and <code>gorun::sleep_for()</code> inside green routines.</p>
+        </div>
+        <div class="card card-dont">
+          <h4>DON'T (Forbidden)</h4>
+          <p>NEVER call <code>std::mutex::lock()</code>, <code>std::condition_variable::wait()</code>, or <code>std::this_thread::sleep_for()</code> inside a green routine — doing so blocks the OS kernel worker thread and freezes all other routines queued on that worker.</p>
+        </div>
+      </div>
+
+      <h3 id="rule-context">4. Go-Style Cascading <code>gorun::Context</code></h3>
+      <div class="grid-2">
+        <div class="card card-do">
+          <h4>DO (The One Way)</h4>
+          <p>Pass <code>gorun::Context</code> as the first parameter to request handlers and DB queries. Pair <code>auto [ctx, cancel] = gorun::with_timeout(parent, 50ms);</code> with <code>GORUN_DEFER { cancel(); };</code> — cancellation detaches from parent in O(1) and cancels the timer immediately (0 leaks).</p>
+        </div>
+        <div class="card card-dont">
+          <h4>DON'T (Forbidden)</h4>
+          <p>NEVER store mutable unsynchronized raw pointers inside <code>gorun::with_value(ctx, key, val)</code>. Store immutable values (<code>std::string</code>, <code>int</code>, <code>std::shared_ptr&lt;const T&gt;</code>) for lock-free reads.</p>
+        </div>
+      </div>
+
+      <h3 id="rule-defer">5. <code>GORUN_DEFER { ... };</code> &amp; <code>gorun::defer(fn)</code></h3>
+      <div class="grid-2">
+        <div class="card card-do">
+          <h4>DO (The One Way)</h4>
+          <p>Use <code>GORUN_DEFER { ... };</code> for guaranteed LIFO resource cleanup at block exit, and use <code>auto guard = gorun::defer(fn);</code> with <code>guard.dismiss()</code> for database/payment transaction rollbacks.</p>
+        </div>
+        <div class="card card-dont">
+          <h4>DON'T (Forbidden)</h4>
+          <p>Remember that in C++, <code>GORUN_DEFER</code> is block-scoped (<code>{ ... }</code>), not function-scoped like Go: placing <code>GORUN_DEFER</code> inside a <code>for</code> loop body runs it at the end of every iteration.</p>
+        </div>
+      </div>
+
+      <h3 id="rule-tls">6. <code>gorun::RoutineLocal&lt;T&gt;</code> vs. <code>thread_local</code></h3>
+      <div class="grid-2">
+        <div class="card card-do">
+          <h4>DO (The One Way)</h4>
+          <p>Use <code>gorun::RoutineLocal&lt;T&gt;</code> (stored directly on <code>Routine</code>, lock-free, auto-destroyed on routine exit) or <code>gorun::Context</code> for routine-specific state that persists across suspension points.</p>
+        </div>
+        <div class="card card-dont">
+          <h4>DON'T (Forbidden)</h4>
+          <p>NEVER cache the address or value of a C++ <code>thread_local</code> variable across a <code>yield()</code>, <code>sleep_for()</code>, <code>Channel</code>, or <code>Mutex</code> operation, because work-stealing may resume the routine on a different OS thread.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- BENCHMARKS -->
+    <section id="benchmarks">
+      <h2>3-Way Performance Benchmarks: <code>gorun</code> vs. Go 1.27.4 vs. Standard C++20</h2>
+      <p>Executed on 16 logical CPU cores (<code>GOMAXPROCS=16</code>, <code>GCC 16.2.0 -O3</code> vs. <code>go1.27.4</code>):</p>
+
+      <div class="bench-row">
+        <div class="bench-label">
+          <span>1. Buffered Channel Throughput (cap=256) — gorun (C++20)</span>
+          <span>75.83 M ops/s (13.2 ns/op) [4.2x Faster than Go, 13.3x vs std]</span>
+        </div>
+        <div class="bar-track"><div class="bar-fill-gorun" style="width: 100%;"></div></div>
+      </div>
+      <div class="bench-row">
+        <div class="bench-label">
+          <span>1. Buffered Channel Throughput (cap=256) — Native Go 1.27.4</span>
+          <span>17.98 M ops/s (55.6 ns/op)</span>
+        </div>
+        <div class="bar-track"><div class="bar-fill-go" style="width: 23.7%;"></div></div>
+      </div>
+      <div class="bench-row">
+        <div class="bench-label">
+          <span>1. Buffered Queue (std::mutex + std::deque) — Standard C++20</span>
+          <span>5.68 M ops/s (176.1 ns/op)</span>
+        </div>
+        <div class="bar-track"><div class="bar-fill-std" style="width: 7.5%;"></div></div>
+      </div>
+
+      <br/>
+
+      <div class="bench-row">
+        <div class="bench-label">
+          <span>2. Unbuffered Channel Rendezvous (cap=0) — gorun (C++20)</span>
+          <span>5.45 M ops/s (183.4 ns/op) [55.8x Faster than std, 1.38x vs Go]</span>
+        </div>
+        <div class="bar-track"><div class="bar-fill-gorun" style="width: 100%;"></div></div>
+      </div>
+      <div class="bench-row">
+        <div class="bench-label">
+          <span>2. Unbuffered Channel Rendezvous (cap=0) — Native Go 1.27.4</span>
+          <span>3.93 M ops/s (254.2 ns/op)</span>
+        </div>
+        <div class="bar-track"><div class="bar-fill-go" style="width: 72.1%;"></div></div>
+      </div>
+      <div class="bench-row">
+        <div class="bench-label">
+          <span>2. Unbuffered Rendezvous (std::mutex + condvar) — Standard C++20</span>
+          <span>0.10 M ops/s (10,247.4 ns/op)</span>
+        </div>
+        <div class="bar-track"><div class="bar-fill-std" style="width: 2.0%;"></div></div>
+      </div>
+    </section>
+
+    <!-- ECOSYSTEM COMPARISON -->
+    <section id="comparison">
+      <h2>Ecosystem Comparison: Why <code>gorun</code> for C++ Web Frameworks?</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Feature</th>
+              <th><code>gorun</code> (C++20/23)</th>
+              <th>C++20 <code>co_await</code> (Asio)</th>
+              <th>Boost.Fiber</th>
+              <th><code>std::jthread</code></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Function Coloring Problem</strong></td>
+              <td><strong>None</strong> (Suspend at any call depth)</td>
+              <td>Viral <code>Task&lt;T&gt;</code> return types</td>
+              <td>None</td>
+              <td>None</td>
+            </tr>
+            <tr>
+              <td><strong>Zero-Setup <code>go()</code> in <code>main()</code></strong></td>
+              <td><strong>Yes</strong> (Lazy runtime + <code>UniversalWaiter</code>)</td>
+              <td>No (Manual <code>io_context</code>)</td>
+              <td>No (Manual scheduler setup)</td>
+              <td>Yes</td>
+            </tr>
+            <tr>
+              <td><strong>Structured <code>Scope</code> + <code>Context</code></strong></td>
+              <td><strong>Built-in</strong> (<code>Scope</code>, <code>Context</code>, <code>GORUN_DEFER</code>)</td>
+              <td>Manual <code>cancellation_slot</code></td>
+              <td>Manual <code>join()</code></td>
+              <td>No</td>
+            </tr>
+            <tr>
+              <td><strong>Multi-Channel <code>select(...)</code></strong></td>
+              <td><strong>Built-in</strong> (True parked 2-phase wait, zero busy-spin)</td>
+              <td>Requires <code>when_any</code></td>
+              <td>No built-in <code>select</code></td>
+              <td>No</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- TEST SUITES -->
+    <section id="tests">
+      <h2>25 Comprehensive Verification &amp; Security Hardening Test Suites</h2>
+      <pre><code>======================================================================
+  gorun C++20 M:N Green Threads Runtime — 25 Comprehensive Test Suites
+  Active OS Worker Threads: 16
+======================================================================
+[TEST 01] Ergonomic go(...) + Buffered Channel in main()... PASSED
+[TEST 02] Unbuffered Rendezvous Channel (capacity == 0, Stack-to-Stack)... PASSED
+[TEST 03] Move-only types (std::unique_ptr&lt;T&gt;) in Channel... PASSED
+[TEST 04] Stack Stability invariant across 100 context switches... PASSED
+[TEST 05] Deep Recursion on isolated 128 KB routine stack... PASSED
+[TEST 06] Transitive Structured Concurrency (nested go([&amp;]) inside Scope)... PASSED
+[TEST 07] TaskGroup Exception propagation &amp; automatic std::stop_token cancel... PASSED
+[TEST 08] gorun::Mutex Race Condition Stress Test (50,000 critical sections)... PASSED
+[TEST 09] Zero OS-thread blocking invariant on 1-Worker Runtime... PASSED
+[TEST 10] gorun::CondVar (notify_one &amp; notify_all with predicate)... PASSED
+[TEST 11] gorun::WaitGroup with multiple concurrent waiting routines... PASSED
+[TEST 12] gorun::Semaphore strict concurrency bound... PASSED
+[TEST 13] gorun::Once / call_once under 100-routine contention... PASSED
+[TEST 14] gorun::RwMutex Readers/Writers invariant check... PASSED
+[TEST 15] gorun::select(...) (on_recv, on_send, on_default, on_timeout)... PASSED
+[TEST 16] gorun::go_async(...) &amp; JoinHandle&lt;T&gt; value and exception... PASSED
+[TEST 17] gorun::RoutineLocal&lt;T&gt; isolation across worker migrations... PASSED
+[TEST 18] Extreme Park/Unpark &amp; Work-Stealing Stress Test (1,000 routines)... PASSED
+[TEST 19] gorun::defer(...) &amp; GORUN_DEFER (LIFO order, dismiss, exception safety)... PASSED
+[TEST 20] Zero Lost Pointers &amp; Exact Constructor/Destructor Audit (10,000 objects)... PASSED (Constructed: 10500, Destroyed: 10500, Live Leaks: 0)
+[TEST 21] Go-Style gorun::Context (with_cancel, with_timeout, with_value, cascading tree)... PASSED
+[TEST 22] Move-only lambdas (std::unique_ptr capture) via UniqueTask... PASSED
+[TEST 23] Context zero-leak children/timers &amp; read-only DoneChannelView... PASSED
+[TEST 24] RoutineLocal&lt;T&gt; zero leak on routine exit &amp; OS-thread isolation... PASSED
+[TEST 25] Channel exception safety, parked select() on close, &amp; nested block_on()... PASSED
+======================================================================
+  ALL 25 TEST SUITES PASSED SUCCESSFULLY!
+======================================================================</code></pre>
+    </section>
+
+    <footer>
+      <div>Created by <strong>Artur Havor</strong> &bull; Licensed under Apache License 2.0</div>
+      <div><a href="https://github.com/Takatochi/gorun" style="color: var(--accent); text-decoration: none;">github.com/Takatochi/gorun</a></div>
+    </footer>
+
+  </main>
+
+  <script>
+    const EXAMPLES = [
+      {
+        filename: "examples/01_channels_and_select.cpp",
+        code: `#include <chrono>
+#include <iostream>
+#include <string>
+#include "gorun/gorun.hpp"
+
+using namespace std::chrono_literals;
+
+int main() {
+    // 1. Unbuffered Rendezvous Channel (capacity = 0): direct stack-to-stack handoff
+    gorun::Channel<std::string> ping_ch(0);
+    gorun::Channel<std::string> pong_ch(0);
+
+    gorun::go([&]() {
+        GORUN_DEFER { ping_ch.close(); };
+        ping_ch.send("PING from green routine #1");
+    });
+
+    gorun::go([&]() {
+        GORUN_DEFER { pong_ch.close(); };
+        if (auto msg = ping_ch.recv()) {
+            pong_ch.send(*msg + " -> PONG from green routine #2");
+        }
+    });
+
+    if (auto reply = pong_ch.recv()) {
+        std::cout << "[Rendezvous] " << *reply << "\\n";
+    }
+
+    // 2. Multi-Channel select(...) with fast/slow workers and timeout
+    gorun::Channel<int> telemetry_ch(4);
+    gorun::Channel<std::string> alert_ch(1);
+
+    gorun::go([&]() {
+        GORUN_DEFER { telemetry_ch.close(); };
+        for (int i = 1; i <= 3; ++i) {
+            gorun::sleep_for(5ms);
+            telemetry_ch.send(i * 100);
+        }
+    });
+
+    gorun::go([&]() {
+        gorun::sleep_for(12ms);
+        alert_ch.send("CPU load spike detected on node-03");
+    });
+
+    for (int step = 0; step < 4; ++step) {
+        gorun::select(
+            telemetry_ch.on_recv([](int metric) {
+                std::cout << "[select] Telemetry metric: " << metric << " req/s\\n";
+            }),
+            alert_ch.on_recv([](std::string alert) {
+                std::cout << "[select] ALERT: " << alert << "\\n";
+            }),
+            gorun::on_timeout(50ms, []() {
+                std::cout << "[select] Timed out waiting for events\\n";
+            })
+        );
+    }
+}`,
+        trace: [
+          { type: "sched", text: "[Scheduler] Lazy init default_runtime(): M:N OS Worker threads started" },
+          { type: "sched", text: "[Worker #0] Spawned Routine #1 & Routine #2 (128 KB stack + 4 KB Guard Page)" },
+          { type: "sched", text: "[Channel<string>] Direct stack-to-stack handoff (0 heap allocs)" },
+          { type: "ok",    text: "[Rendezvous] PING from green routine #1 -> PONG from green routine #2" },
+          { type: "info",  text: "[select] Telemetry metric: 100 req/s" },
+          { type: "info",  text: "[select] Telemetry metric: 200 req/s" },
+          { type: "warn",  text: "[select] ALERT: CPU load spike detected on node-03" },
+          { type: "info",  text: "[select] Telemetry metric: 300 req/s" },
+          { type: "sched", text: "[GORUN_DEFER] Closed channels | Recycled 4 stacks to local_free_routines_" }
+        ]
+      },
+      {
+        filename: "examples/02_structured_concurrency_and_defer.cpp",
+        code: `#include <iostream>
+#include <numeric>
+#include <stdexcept>
+#include <vector>
+#include "gorun/gorun.hpp"
+
+void execute_payment_transaction(int tx_id, bool simulate_failure) {
+    std::cout << "[Tx #" << tx_id << "] Opening ledger transaction...\\n";
+
+    auto rollback = gorun::defer([tx_id]() {
+        std::cout << "[Tx #" << tx_id << "] ROLLBACK executed automatically!\\n";
+    });
+
+    if (simulate_failure) {
+        throw std::runtime_error("Insufficient funds in account");
+    }
+
+    std::cout << "[Tx #" << tx_id << "] COMMIT succeeded!\\n";
+    rollback.dismiss(); // Disarms rollback guard after commit!
+}
+
+int main() {
+    // 1. Safe [&] reference capture inside gorun::Scope
+    std::vector<int> partial_sums(8, 0);
+    {
+        gorun::Scope scope;
+        for (int i = 0; i < 8; ++i) {
+            gorun::go([&, i]() {
+                gorun::yield();
+                partial_sums[i] = (i + 1) * 10;
+            });
+        }
+    } // ~Scope() parks until all 8 green routines complete!
+
+    int total = std::accumulate(partial_sums.begin(), partial_sums.end(), 0);
+    std::cout << "[Scope] Parallel sum of 8 stack-captured slices: " << total << "\\n";
+
+    // 2. Defer rollback guard (Success vs Exception)
+    execute_payment_transaction(101, false);
+    try {
+        execute_payment_transaction(102, true);
+    } catch (const std::exception& ex) {
+        std::cout << "[Tx #102] Caught exception: " << ex.what() << "\\n";
+    }
+}`,
+        trace: [
+          { type: "sched", text: "[Scope] Opened implicit structured scope on stack frame" },
+          { type: "sched", text: "[Work-Stealing] 8 green routines distributed across OS workers" },
+          { type: "ok",    text: "[Scope] Parallel sum of 8 stack-captured slices: 360" },
+          { type: "info",  text: "[Tx #101] Opening ledger transaction..." },
+          { type: "ok",    text: "[Tx #101] COMMIT succeeded! (rollback.dismiss() called)" },
+          { type: "info",  text: "[Tx #102] Opening ledger transaction..." },
+          { type: "warn",  text: "[Tx #102] ROLLBACK executed automatically!" },
+          { type: "warn",  text: "[Tx #102] Caught exception: Insufficient funds in account" },
+          { type: "sched", text: "[Scope] ~Scope() verified 0 dangling [&] references" }
+        ]
+      },
+      {
+        filename: "examples/03_web_microservice_context.cpp",
+        code: `#include <chrono>
+#include <iostream>
+#include <mutex>
+#include <string>
+#include "gorun/gorun.hpp"
+
+using namespace std::chrono_literals;
+
+int main() {
+    gorun::Semaphore db_pool(4); // Max 4 concurrent DB queries
+    gorun::Mutex cout_mtx;
+    gorun::Scope server_scope;
+
+    for (int req_id = 1; req_id <= 4; ++req_id) {
+        gorun::go([&, req_id]() {
+            auto base_ctx = gorun::with_value(
+                gorun::background(), "trace_id", "req-" + std::to_string(1000 + req_id)
+            );
+            // Enforce strict 25ms SLA timeout per HTTP request
+            auto [req_ctx, cancel] = gorun::with_timeout(base_ctx, 25ms);
+            GORUN_DEFER { cancel(); };
+
+            auto db_latency = (req_id % 2 == 1) ? 8ms : 60ms;
+            gorun::Channel<std::string> db_ch(1);
+
+            gorun::go([&, req_ctx, db_latency]() {
+                db_pool.acquire();
+                GORUN_DEFER { db_pool.release(); };
+                gorun::select(
+                    gorun::on_timeout(db_latency, [&]() {
+                        db_ch.send(R"({"user": "Artur Havor", "role": "Admin"})");
+                    }),
+                    req_ctx.on_done([]() {})
+                );
+            });
+
+            gorun::select(
+                db_ch.on_recv([&](std::string json) {
+                    std::lock_guard lk(cout_mtx);
+                    std::cout << "HTTP #" << req_id << " -> [200 OK] " << json << "\\n";
+                }),
+                req_ctx.on_done([&]() {
+                    std::lock_guard lk(cout_mtx);
+                    std::cout << "HTTP #" << req_id << " -> [504 Gateway Timeout] "
+                              << gorun::to_string(*req_ctx.err()) << "\\n";
+                })
+            );
+        });
+    }
+}`,
+        trace: [
+          { type: "sched", text: "[HTTP Server] Spawned 4 concurrent request routines (25ms SLA timeout each)" },
+          { type: "ok",    text: "HTTP #1 -> [200 OK] {\"user\": \"Artur Havor\", \"role\": \"Admin\"}" },
+          { type: "ok",    text: "HTTP #3 -> [200 OK] {\"user\": \"Artur Havor\", \"role\": \"Admin\"}" },
+          { type: "sched", text: "[Timer Thread] Cancellable deadline expired at 25.0ms for req-1002 & req-1004" },
+          { type: "warn",  text: "HTTP #2 -> [504 Gateway Timeout] context deadline exceeded" },
+          { type: "warn",  text: "HTTP #4 -> [504 Gateway Timeout] context deadline exceeded" },
+          { type: "sched", text: "[Context Tree] Cascaded cancellation & cancelled timers (0 timer leaks)" }
+        ]
+      },
+      {
+        filename: "examples/04_worker_pool_and_sync.cpp",
+        code: `#include <iostream>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include "gorun/gorun.hpp"
+
+int main() {
+    gorun::Once init_once;
+    gorun::RwMutex rw_mtx;
+    std::unordered_map<int, std::string> cache;
+
+    std::vector<gorun::JoinHandle<std::string>> handles;
+
+    for (int i = 1; i <= 6; ++i) {
+        int key = (i % 3) + 1;
+        handles.push_back(gorun::go_async([&, key]() -> std::string {
+            gorun::call_once(init_once, [&]() {
+                std::unique_lock<gorun::RwMutex> wlock(rw_mtx);
+                cache[1] = "Cached-Config-Alpha";
+                cache[2] = "Cached-Config-Beta";
+            });
+
+            {
+                std::shared_lock<gorun::RwMutex> rlock(rw_mtx);
+                if (auto it = cache.find(key); it != cache.end()) {
+                    return it->second;
+                }
+            }
+
+            std::unique_lock<gorun::RwMutex> wlock(rw_mtx);
+            return cache.emplace(key, "Computed-Value-300").first->second;
+        }));
+    }
+
+    for (std::size_t i = 0; i < handles.size(); ++i) {
+        std::cout << "[JoinHandle #" << (i + 1) << "] " << handles[i].get() << "\\n";
+    }
+}`,
+        trace: [
+          { type: "sched", text: "[go_async] Spawned 6 green routines returning JoinHandle<std::string>" },
+          { type: "info",  text: "[Once] Cache initialized exactly once under 6-routine contention!" },
+          { type: "ok",    text: "[JoinHandle #1] Cached-Config-Beta" },
+          { type: "ok",    text: "[JoinHandle #2] Computed-Value-300" },
+          { type: "ok",    text: "[JoinHandle #3] Cached-Config-Alpha" },
+          { type: "ok",    text: "[JoinHandle #4] Cached-Config-Beta" },
+          { type: "ok",    text: "[JoinHandle #5] Computed-Value-300" },
+          { type: "ok",    text: "[JoinHandle #6] Cached-Config-Alpha" }
+        ]
+      },
+      {
+        filename: "examples/05_memory_arenas_and_pointers.cpp",
+        code: `#include <array>
+#include <cassert>
+#include <iostream>
+#include <memory>
+#include "gorun/gorun.hpp"
+
+struct StackWorkNode {
+    int node_id{0};
+    int computed_result{0};
+    const StackWorkNode* self_stack_addr{nullptr};
+};
+
+int main() {
+    // Parent routine allocates 32 nodes on its OWN 128 KB stack frame
+    // and passes raw pointers (&stack_nodes[i]) to 32 child routines!
+    gorun::Scope outer_scope;
+
+    gorun::go([]() {
+        std::array<StackWorkNode, 32> stack_nodes{};
+        for (int i = 0; i < 32; ++i) {
+            stack_nodes[i].node_id = i + 1;
+            stack_nodes[i].self_stack_addr = &stack_nodes[i];
+        }
+
+        {
+            gorun::Scope inner_scope;
+            for (int i = 0; i < 32; ++i) {
+                StackWorkNode* raw_ptr = &stack_nodes[i];
+                gorun::go([raw_ptr]() {
+                    for (int step = 0; step < 10; ++step) {
+                        gorun::yield(); // Migrates across OS cores!
+                        assert(raw_ptr == raw_ptr->self_stack_addr);
+                        raw_ptr->computed_result += raw_ptr->node_id;
+                    }
+                });
+            }
+        } // ~inner_scope() parks parent until all 32 children finish!
+
+        int sum = 0;
+        for (const auto& n : stack_nodes) sum += n.computed_result;
+        std::cout << "[Stack Pointer Tree] Verified 32 children mutating parent stack: sum = " << sum << "\\n";
+    });
+}`,
+        trace: [
+          { type: "sched", text: "[StackPool] Allocated fixed 128 KB stack + 4 KB hardware Guard Page" },
+          { type: "sched", text: "[Stack Stability] Parent stack frame shared via raw pointers with 32 child routines" },
+          { type: "ok",    text: "[Stack Pointer Tree] Verified 32 children mutating parent stack: sum = 5280" },
+          { type: "sched", text: "[Pointer Audit] Stack addresses invariant across 320 yield() migrations | 0 leaks" }
+        ]
+      },
+      {
+        filename: "sandbox/my_gorun_program.cpp",
+        code: `#include <iostream>
+#include <memory>
+#include <string>
+#include "gorun/gorun.hpp"
+
+// Write any C++20 code using gorun below and click "Run Live C++20" (Ctrl+Enter)!
+int main() {
+    gorun::Channel<std::string> ch(8);
+
+    // Move-only lambda capturing std::unique_ptr works natively in gorun::go()!
+    auto secret = std::make_unique<int>(2026);
+    gorun::go([&ch, ptr = std::move(secret)]() {
+        GORUN_DEFER { ch.close(); };
+        ch.send("Hello from custom live gorun routine!");
+        ch.send("Moved unique_ptr value = " + std::to_string(*ptr));
+    });
+
+    while (auto msg = ch.recv()) {
+        std::cout << *msg << "\\n";
+    }
+    return 0;
+}`,
+        trace: [
+          { type: "info",  text: "Sandbox mode: Edit the C++20 code on the left and click 'Run Live C++20' to execute on real GCC 14.2!" },
+          { type: "ok",    text: "Hello from custom live gorun routine!" },
+          { type: "ok",    text: "Moved unique_ptr value = 2026" }
+        ]
+      }
+    ];
+
+    let currentIdx = 0;
+    let timerIds = [];
+    let cmEditor = null;
+    let cachedGorunHeader = null;
+
+    function getEditorValue() {
+      return cmEditor ? cmEditor.getValue() : document.getElementById('pg-editor').value;
+    }
+
+    function setEditorValue(val) {
+      if (cmEditor) {
+        cmEditor.setValue(val);
+      } else {
+        document.getElementById('pg-editor').value = val;
+      }
+    }
+
+    function stripAnsi(text) {
+      return String(text || '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+    }
+
+    function appendConsoleLine(text, cls) {
+      const consoleEl = document.getElementById('pg-console');
+      const line = document.createElement('div');
+      line.className = 'console-line-' + cls;
+      line.textContent = text;
+      consoleEl.appendChild(line);
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+    }
+
+    async function fetchGorunHeader() {
+      if (cachedGorunHeader) return cachedGorunHeader;
+      const urls = [
+        'https://raw.githubusercontent.com/Takatochi/gorun/main/single_include/gorun/gorun.hpp'
+      ];
+      let lastErr = null;
+      for (const url of urls) {
+        try {
+          const resp = await fetch(url, { cache: 'no-cache' });
+          if (resp.ok) {
+            const text = await resp.text();
+            if (text.includes('namespace gorun')) {
+              cachedGorunHeader = text;
+              const kb = (text.length / 1024).toFixed(1);
+              document.getElementById('stat-header').textContent = 'gorun.hpp (' + kb + ' KB)';
+              return cachedGorunHeader;
+            }
+          }
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      throw new Error('Could not load single-header gorun.hpp (' + (lastErr ? lastErr.message : 'fetch failed') + ')');
+    }
+
+    async function runLiveCompiler() {
+      timerIds.forEach(id => clearTimeout(id));
+      timerIds = [];
+
+      const runBtn = document.getElementById('pg-run-btn');
+      const consoleEl = document.getElementById('pg-console');
+      const statusEl = document.getElementById('pg-status');
+      const titleEl = document.getElementById('pg-output-title');
+      const flags = document.getElementById('pg-flags').value;
+
+      runBtn.disabled = true;
+      consoleEl.innerHTML = '';
+      titleEl.textContent = 'Live GCC 14.2 Compilation & Execution (Compiler Explorer)';
+      statusEl.textContent = 'Loading gorun.hpp & compiling...';
+      statusEl.style.color = 'var(--amber)';
+      document.getElementById('stat-time').textContent = '...';
+      document.getElementById('stat-exit').textContent = '...';
+
+      appendConsoleLine('[Compiler] Fetching single-header gorun/gorun.hpp...', 'sched');
+
+      try {
+        const hdr = await fetchGorunHeader();
+        const userCode = getEditorValue();
+
+        appendConsoleLine('[Compiler] Compiling on GCC 14.2.0 (' + flags + ')...', 'sched');
+        const t0 = performance.now();
+
+        const payload = {
+          source: userCode,
+          options: {
+            userArguments: flags,
+            executeParameters: { args: [], stdin: '' },
+            compilerOptions: { executorRequest: true },
+            filters: { execute: true }
+          },
+          files: [
+            { filename: 'gorun/gorun.hpp', contents: hdr }
+          ]
+        };
+
+        const resp = await fetch('https://godbolt.org/api/compiler/g142/compile', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: JSON.stringify(payload)
+        });
+
+        if (!resp.ok) {
+          throw new Error('Compiler Explorer HTTP ' + resp.status + ' ' + resp.statusText);
+        }
+
+        const data = await resp.json();
+        const elapsedMs = Math.round(performance.now() - t0);
+
+        const buildStderr = (data.buildResult && data.buildResult.stderr) ? data.buildResult.stderr : [];
+        const buildCode = (data.buildResult && typeof data.buildResult.code === 'number') ? data.buildResult.code : data.code;
+
+        if (buildStderr.length > 0) {
+          appendConsoleLine('--- Compiler Diagnostics ---', 'warn');
+          buildStderr.forEach(item => {
+            const cleaned = stripAnsi(item.text);
+            const isErr = /error:/i.test(cleaned);
+            appendConsoleLine(cleaned, isErr ? 'err' : 'warn');
+          });
+        }
+
+        if (buildCode !== 0 || !data.didExecute) {
+          statusEl.textContent = 'Compilation Failed (Exit ' + buildCode + ')';
+          statusEl.style.color = 'var(--red)';
+          document.getElementById('stat-time').textContent = elapsedMs + ' ms';
+          document.getElementById('stat-exit').textContent = String(buildCode);
+          if (buildStderr.length === 0 && Array.isArray(data.stderr)) {
+            data.stderr.forEach(item => appendConsoleLine(stripAnsi(item.text), 'err'));
+          }
+          return;
+        }
+
+        appendConsoleLine('--- Program Output (Real Linux x86_64 Execution) ---', 'info');
+        const outLines = Array.isArray(data.stdout) ? data.stdout : [];
+        const errLines = Array.isArray(data.stderr) ? data.stderr : [];
+
+        if (outLines.length === 0 && errLines.length === 0) {
+          appendConsoleLine('(Program exited cleanly with no stdout output)', 'sched');
+        } else {
+          outLines.forEach(item => appendConsoleLine(stripAnsi(item.text), 'stdout'));
+          errLines.forEach(item => appendConsoleLine(stripAnsi(item.text), 'err'));
+        }
+
+        const execMs = data.execTime ? (data.execTime + ' ms remote') : (elapsedMs + ' ms');
+        const exitCode = typeof data.code === 'number' ? data.code : 0;
+        document.getElementById('stat-time').textContent = execMs;
+        document.getElementById('stat-exit').textContent = String(exitCode);
+
+        if (exitCode === 0) {
+          appendConsoleLine('[Done] Process exited with code 0 (' + elapsedMs + ' ms total round-trip)', 'ok');
+          statusEl.textContent = 'Executed Live (Exit 0)';
+          statusEl.style.color = 'var(--green)';
+        } else {
+          appendConsoleLine('[Done] Process exited with non-zero code ' + exitCode, 'err');
+          statusEl.textContent = 'Runtime Exit ' + exitCode;
+          statusEl.style.color = 'var(--red)';
+        }
+      } catch (err) {
+        appendConsoleLine('[Error] ' + err.message, 'err');
+        appendConsoleLine('Tip: Check internet connectivity or click "Trace Preview" for offline M:N trace.', 'warn');
+        statusEl.textContent = 'Remote Error';
+        statusEl.style.color = 'var(--red)';
+      } finally {
+        runBtn.disabled = false;
+      }
+    }
+
+    function runTracePreview() {
+      timerIds.forEach(id => clearTimeout(id));
+      timerIds = [];
+      const consoleEl = document.getElementById('pg-console');
+      const statusEl = document.getElementById('pg-status');
+      const titleEl = document.getElementById('pg-output-title');
+
+      consoleEl.innerHTML = '';
+      titleEl.textContent = 'M:N Runtime Trace Preview (Instant Local)';
+      statusEl.textContent = 'Playing Trace Preview...';
+      statusEl.style.color = 'var(--amber)';
+
+      const trace = EXAMPLES[currentIdx].trace;
+      trace.forEach((item, i) => {
+        const tid = setTimeout(() => {
+          appendConsoleLine(item.text, item.type);
+          if (i === trace.length - 1) {
+            statusEl.textContent = 'Trace Preview Complete (Click "Run Live C++20" to compile)';
+            statusEl.style.color = 'var(--green)';
+            document.getElementById('stat-time').textContent = 'Instant Preview';
+            document.getElementById('stat-exit').textContent = '0';
+          }
+        }, i * 95);
+        timerIds.push(tid);
+      });
+    }
+
+    function loadExample(idx) {
+      currentIdx = idx;
+      const tabs = document.querySelectorAll('.tab-btn');
+      tabs.forEach((btn, i) => btn.classList.toggle('active', i === idx));
+      document.getElementById('pg-filename').textContent = EXAMPLES[idx].filename;
+      setEditorValue(EXAMPLES[idx].code);
+      runTracePreview();
+    }
+
+    function resetExample() {
+      setEditorValue(EXAMPLES[currentIdx].code);
+      const statusEl = document.getElementById('pg-status');
+      statusEl.textContent = 'Reset to example template';
+      statusEl.style.color = 'var(--accent)';
+    }
+
+    function copyCode() {
+      navigator.clipboard.writeText(getEditorValue());
+      const statusEl = document.getElementById('pg-status');
+      statusEl.textContent = 'Copied C++ code to clipboard';
+      statusEl.style.color = 'var(--accent)';
+    }
+
+    // Lightweight JetBrains IDEA Darcula Syntax Highlighter for Static C++ Code Blocks
+    function highlightStaticCppBlocks() {
+      const keywords = new Set([
+        'auto','bool','break','case','catch','char','class','const','constexpr','continue',
+        'default','delete','do','double','else','enum','explicit','false','float','for',
+        'if','inline','int','long','mutable','namespace','new','noexcept','nullptr','operator',
+        'private','protected','public','return','short','signed','sizeof','static','struct',
+        'switch','template','this','throw','true','try','typename','unsigned','using','virtual',
+        'void','while'
+      ]);
+      const types = new Set([
+        'Channel','Scope','TaskGroup','Context','Mutex','RwMutex','CondVar','WaitGroup',
+        'Semaphore','Once','JoinHandle','RoutineLocal','LinearArena','PacketSlab','HttpHeaderNode',
+        'string','vector','array','unique_ptr','shared_ptr','optional','uint64_t','size_t','int64_t'
+      ]);
+
+      document.querySelectorAll('pre code.lang-cpp').forEach(block => {
+        const raw = block.textContent;
+        const tokenRe = /(\/\/[^\n]*|\/\*[\s\S]*?\*\/|R"\([\s\S]*?\)"|"(?:\\.|[^"\\])*"|^\s*#\s*[a-zA-Z_]+|\bGORUN_[A-Z0-9_]+\b|\b\d+(?:\.\d+)?(?:ms|us|ns|s|u|ul|ull)?\b|\b[A-Za-z_][A-Za-z0-9_]*\b)/gm;
+        let out = '';
+        let last = 0;
+        let m;
+        const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        while ((m = tokenRe.exec(raw)) !== null) {
+          out += esc(raw.slice(last, m.index));
+          const tok = m[0];
+          if (tok.startsWith('//') || tok.startsWith('/*')) {
+            out += '<span class="tok-cmt">' + esc(tok) + '</span>';
+          } else if (tok.startsWith('"') || tok.startsWith('R"(')) {
+            out += '<span class="tok-str">' + esc(tok) + '</span>';
+          } else if (tok.trimStart().startsWith('#') || tok.startsWith('GORUN_')) {
+            out += '<span class="tok-mac">' + esc(tok) + '</span>';
+          } else if (/^\d/.test(tok)) {
+            out += '<span class="tok-num">' + esc(tok) + '</span>';
+          } else if (keywords.has(tok)) {
+            out += '<span class="tok-kw">' + esc(tok) + '</span>';
+          } else if (tok === 'gorun' || tok === 'std') {
+            out += '<span class="tok-ns">' + esc(tok) + '</span>';
+          } else if (types.has(tok)) {
+            out += '<span class="tok-ty">' + esc(tok) + '</span>';
+          } else if (raw[tokenRe.lastIndex] === '(') {
+            out += '<span class="tok-fn">' + esc(tok) + '</span>';
+          } else {
+            out += esc(tok);
+          }
+          last = tokenRe.lastIndex;
+        }
+        out += esc(raw.slice(last));
+        block.innerHTML = out;
+      });
+    }
+
+    function initPlayground() {
+      highlightStaticCppBlocks();
+      const textarea = document.getElementById('pg-editor');
+      if (window.CodeMirror) {
+        cmEditor = CodeMirror.fromTextArea(textarea, {
+          mode: 'text/x-c++src',
+          theme: 'idea-darcula',
+          lineNumbers: true,
+          styleActiveLine: true,
+          matchBrackets: true,
+          autoCloseBrackets: true,
+          indentUnit: 4,
+          tabSize: 4,
+          indentWithTabs: false,
+          extraKeys: {
+            'Ctrl-Enter': () => runLiveCompiler(),
+            'Cmd-Enter': () => runLiveCompiler()
+          }
+        });
+      }
+      loadExample(0);
+    }
+
+    window.addEventListener('load', initPlayground);
+  </script>
+
+</body>
+</html>
